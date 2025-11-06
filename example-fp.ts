@@ -1,6 +1,6 @@
 // ====== imports ======
-import { match, P } from "npm:ts-pattern";           // Nodeなら: from "ts-pattern"
-import { parseArith } from "./book/tiny-ts-parser.ts";
+import {match, P} from "npm:ts-pattern"; // Nodeなら: from "ts-pattern"
+import {parseArith} from "./book/tiny-ts-parser.ts";
 
 // ====== 1) 定数群（タグ/記号/JS型名/エラー）============================
 
@@ -208,8 +208,14 @@ const typecheckAlg: TermAlg<Result<Type, ErrorCode>> = {
     },
 };
 
-export const typecheck = (t: Term): Result<Type, ErrorCode> =>
-    foldTerm(typecheckAlg, t);
+// 成功は Type をそのまま、失敗は Err<ErrorCode> を返す型
+export type TypecheckOut = Type | Err<ErrorCode>;
+
+export const typecheck = (t: Term): TypecheckOut => {
+    const r = foldTerm(typecheckAlg, t);     // Result<Type, ErrorCode>
+    return r.tag === ResultTag.Ok ? r.value  // ← 生の { tag: "Number" } などを返す
+        : r;       // ← 失敗は Err をそのまま返す
+};
 
 // 表示用にエラーコードをメッセージへ
 export const formatErrors = (errs: ReadonlyArray<ErrorCode>) =>
