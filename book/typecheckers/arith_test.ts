@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
+import * as fc from "npm:fast-check";
+
 import {parseArith, typeShow} from "npm:tiny-ts-parser";
 import {typecheck} from "./arith.ts";
 
@@ -25,3 +27,34 @@ test("number", () => ok("number", `1`));
 test("add", () => ok("number", `1 + 2`));
 test("add error 1", () => ng(/test.ts:1:1-1:5 number expected/, `true + 1`));
 test("add error 2", () => ng(/test.ts:1:5-1:9 number expected/, `1 + true`));
+
+//以下からは追加テストケース
+test("property: すべての整数リテラルは number 型になる", () => {
+  fc.assert(
+    fc.property(fc.nat(), (n) => { // fc.integer() → fc.nat()
+      const code = `${n}`;
+      const ty = typeShow(typecheck(parseArith(code)));
+      assert.equal(ty, "number");
+    }),
+  );
+});
+
+test("property: 任意の (number + number) は number 型になる", () => {
+  fc.assert(
+    fc.property(fc.nat(), fc.nat(), (a, b) => { // fc.integer() → fc.nat()
+      const code = `${a} + ${b}`;
+      const ty = typeShow(typecheck(parseArith(code)));
+      assert.equal(ty, "number");
+    }),
+  );
+});
+
+test("property: (true ? x : y) は x,y の型が一致すれば型エラーにならない", () => {
+  fc.assert(
+    fc.property(fc.boolean(), fc.nat(), fc.nat(), (cond, x, y) => { // fc.integer() → fc.nat()
+      const code = `${cond} ? ${x} : ${y}`;
+      const ty = typeShow(typecheck(parseArith(code)));
+      assert.equal(ty, "number");
+    }),
+  );
+});
