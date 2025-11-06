@@ -1,104 +1,138 @@
-import { error } from "npm:tiny-ts-parser";
+// ====== imports ======
+import {error} from "npm:tiny-ts-parser"; // ← これを追加！
 
-type Type =
-  | { tag: "Boolean" }
-  | { tag: "Number" }
-  | { tag: "Func"; params: Param[]; retType: Type };
+// ====== 1) 定数群（タグ/記号/JS型名/エラー）============================
+
+// --- ASTタグ（Term）
+export const TermTag = {
+  True: "true",
+  False: "false",
+  If: "if",
+  Number: "number",
+  Add: "add",
+  Var: "var",
+  Func: "func",
+  Call: "call",
+  Seq: "seq",
+  Const: "const",
+} as const;
+
+// --- 型タグ（対象言語の型）
+export const TypeTag = {
+  Boolean: "Boolean",
+  Number: "Number",
+  Func: "Func",
+} as const;
+
+// --- Resultタグ
+export const ResultTag = {
+  Ok: "Ok",
+  Err: "Err",
+} as const;
+
+// --- エラーコード（内部識別子）
+export const ErrorCode = {
+  IfCondNotBoolean: "IfCondNotBoolean",
+  IfBranchesMismatch: "IfBranchesMismatch",
+  RuntimeAddType: "RuntimeAddType",
+  RuntimeIfType: "RuntimeIfType",
+  Unreachable: "Unreachable",
+} as const;
+export type ErrorCode = typeof ErrorCode[keyof typeof ErrorCode];
+
+// --- エラーメッセージ（表示用）
+export const Messages: Record<ErrorCode, string> = {
+  [ErrorCode.IfCondNotBoolean]: "boolean expected",
+  [ErrorCode.IfBranchesMismatch]: "then and else have different types",
+  [ErrorCode.RuntimeAddType]: "number expected",
+  [ErrorCode.RuntimeIfType]: "boolean expected",
+  [ErrorCode.Unreachable]: "unreachable",
+};
+
+// ====== 2) AST / Type / Value / Result =================================
+
+// --- AST node 型（tag は必ず TermTag.* を使う）
+export type Term =
+  | { tag: typeof TermTag.True }
+  | { tag: typeof TermTag.False }
+  | { tag: typeof TermTag.If; cond: Term; thn: Term; els: Term }
+  | { tag: typeof TermTag.Number; n: number }
+  | { tag: typeof TermTag.Add; left: Term; right: Term }
+  | { tag: typeof TermTag.Var; name: string }
+  | { tag: typeof TermTag.Func; params: Param[]; body: Term }
+  | { tag: typeof TermTag.Call; func: Term; args: Term[] }
+  | { tag: typeof TermTag.Seq; body: Term; rest: Term }
+  | { tag: typeof TermTag.Const; name: string; init: Term; rest: Term };
+
+export type Type =
+  | { tag: typeof TypeTag.Boolean }
+  | { tag: typeof TypeTag.Number }
+  | { tag: typeof TypeTag.Func; params: Type[]; ret: Type };
 
 type Param = { name: string; type: Type };
 
-type Term =
-  | { tag: "true" }
-  | { tag: "false" }
-  | { tag: "if"; cond: Term; thn: Term; els: Term }
-  | { tag: "number"; n: number }
-  | { tag: "add"; left: Term; right: Term }
-  | { tag: "var"; name: string }
-  | { tag: "func"; params: Param[]; body: Term }
-  | { tag: "call"; func: Term; args: Term[] }
-  | { tag: "seq"; body: Term; rest: Term }
-  | { tag: "const"; name: string; init: Term; rest: Term };
+export type Err<E> = { tag: typeof ResultTag.Err; error: ReadonlyArray<E> };
+export type Ok<A> = { tag: typeof ResultTag.Ok; value: A };
+export type Result<A, E> = Ok<A> | Err<E>;
 
-type TypeEnv = Record<string, Type>;
+// ====== 4) fold（catamorphism：再帰の形を一箇所に集約）=================
 
-function typeEq(ty1: Type, ty2: Type): boolean {
-  switch (ty2.tag) {
-    case "Boolean":
-      return ty1.tag === "Boolean";
-    case "Number":
-      return ty1.tag === "Number";
-    case "Func": {
-      if (ty1.tag !== "Func") return false;
-      if (ty1.params.length !== ty2.params.length) return false;
-      for (let i = 0; i < ty1.params.length; i++) {
-        if (!typeEq(ty1.params[i].type, ty2.params[i].type)) {
-          return false;
-        }
-      }
-      if (!typeEq(ty1.retType, ty2.retType)) return false;
-      return true;
+type Child<A> = { out: A; node: Term };
+
+type TermParaAlg<A> = {
+  True: (self: Term) => A;
+  False: (self: Term) => A;
+  Number: (n: number, self: Term) => A;
+  Add: (left: Child<A>, right: Child<A>, self: Term) => A;
+  If: (cond: Child<A>, thn: Child<A>, els: Child<A>, self: Term) => A;
+};
+
+export function paraTerm<A>(alg: TermParaAlg<A>, t: Term): A {
+  switch (t.tag) {
+    case TermTag.True:
+      return alg.True(t);
+    case TermTag.False:
+      return alg.False(t);
+    case TermTag.Number:
+      return alg.Number(t.n, t);
+    case TermTag.Add: {
+      const l = { out: paraTerm(alg, t.left), node: t.left };
+      const r = { out: paraTerm(alg, t.right), node: t.right };
+      return alg.Add(l, r, t);
+    }
+    case TermTag.If: {
+      const c = { out: paraTerm(alg, t.cond), node: t.cond };
+      const th = { out: paraTerm(alg, t.thn), node: t.thn };
+      const el = { out: paraTerm(alg, t.els), node: t.els };
+      return alg.If(c, th, el, t);
     }
   }
 }
 
-export function typecheck(t: Term, tyEnv: TypeEnv): Type {
-  switch (t.tag) {
-    case "true":
-      return { tag: "Boolean" };
-    case "false":
-      return { tag: "Boolean" };
-    case "if": {
-      const condTy = typecheck(t.cond, tyEnv);
-      if (condTy.tag !== "Boolean") error("boolean expected", t.cond);
-      const thnTy = typecheck(t.thn, tyEnv);
-      const elsTy = typecheck(t.els, tyEnv);
-      if (!typeEq(thnTy, elsTy)) {
-        error("then and else have different types", t);
+export function typecheck(t: Term): Type {
+  return paraTerm<Type>({
+    True: () => ({ tag: TypeTag.Boolean }),
+    False: () => ({ tag: TypeTag.Boolean }),
+    Number: () => ({ tag: TypeTag.Number }),
+
+    Add: (L, R) => {
+      if (L.out.tag !== TypeTag.Number) {
+        error(Messages[ErrorCode.RuntimeAddType], L.node);
       }
-      return thnTy;
-    }
-    case "number":
-      return { tag: "Number" };
-    case "add": {
-      const leftTy = typecheck(t.left, tyEnv);
-      if (leftTy.tag !== "Number") error("number expected", t.left);
-      const rightTy = typecheck(t.right, tyEnv);
-      if (rightTy.tag !== "Number") error("number expected", t.right);
-      return { tag: "Number" };
-    }
-    case "var": {
-      if (tyEnv[t.name] === undefined) error(`unknown variable: ${t.name}`, t);
-      return tyEnv[t.name];
-    }
-    case "func": {
-      const newTyEnv = { ...tyEnv };
-      for (const { name, type } of t.params) {
-        newTyEnv[name] = type;
+      if (R.out.tag !== TypeTag.Number) {
+        error(Messages[ErrorCode.RuntimeAddType], R.node);
       }
-      const retType = typecheck(t.body, newTyEnv);
-      return { tag: "Func", params: t.params, retType };
-    }
-    case "call": {
-      const funcTy = typecheck(t.func, tyEnv);
-      if (funcTy.tag !== "Func") error("function type expected", t.func);
-      if (funcTy.params.length !== t.args.length) {
-        error("wrong number of arguments", t);
+      return { tag: TypeTag.Number };
+    },
+
+    If: (C, T, E, self) => {
+      if (C.out.tag !== TypeTag.Boolean) {
+        error(Messages[ErrorCode.RuntimeIfType], C.node);
       }
-      for (let i = 0; i < t.args.length; i++) {
-        const argTy = typecheck(t.args[i], tyEnv);
-        if (!typeEq(argTy, funcTy.params[i].type)) {
-          error("parameter type mismatch", t.args[i]);
-        }
+      if (T.out.tag !== E.out.tag) {
+        error(Messages[ErrorCode.IfBranchesMismatch], self);
       }
-      return funcTy.retType;
-    }
-    case "seq":
-      typecheck(t.body, tyEnv);
-      return typecheck(t.rest, tyEnv);
-    case "const": {
-      const ty = typecheck(t.init, tyEnv);
-      const newTyEnv = { ...tyEnv, [t.name]: ty };
-      return typecheck(t.rest, newTyEnv);
-    }
-  }
+      return T.out;
+    },
+  }, t);
 }
