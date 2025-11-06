@@ -1,10 +1,10 @@
 // ====== imports ======
-import { match, P } from "ts-pattern";           // Deno: "npm:ts-pattern"
+import { match, P } from "npm:ts-pattern";           // Nodeなら: from "ts-pattern"
 import { parseArith } from "./book/tiny-ts-parser.ts";
 
-// ====== 1) 定数群（タグ/キーワード/演算子/メッセージ）================
+// ====== 1) 定数群（タグ/記号/JS型名/エラー）============================
 
-// --- ASTタグ
+// --- ASTタグ（Term）
 export const TermTag = {
     True:   "true",
     False:  "false",
@@ -13,10 +13,16 @@ export const TermTag = {
     Add:    "add",
 } as const;
 
-// --- 型タグ
+// --- 型タグ（対象言語の型）
 export const TypeTag = {
     Boolean: "Boolean",
     Number:  "Number",
+} as const;
+
+// --- 値タグ（評価結果の表現：対象言語の値を構造体で保持）
+export const ValueTag = {
+    Boolean: "BoolValue",
+    Number:  "NumValue",
 } as const;
 
 // --- Resultタグ
@@ -25,7 +31,7 @@ export const ResultTag = {
     Err: "Err",
 } as const;
 
-// --- プリティプリントで使う語句・記号
+// --- プリティプリント用の語句・記号
 export const KW = {
     true:  "true",
     false: "false",
@@ -40,17 +46,23 @@ export const SYM = {
     rpar: ")",
 } as const;
 
-// --- エラーコード（アプリ内で使う識別子）
+// --- JSの typeof で使う型名（生文字列を排除）
+export const JsType = {
+    Number: "number",
+    Boolean: "boolean",
+} as const;
+
+// --- エラーコード（内部識別子）
 export const ErrorCode = {
-    IfCondNotBoolean:     "IfCondNotBoolean",
-    IfBranchesMismatch:   "IfBranchesMismatch",
-    RuntimeAddType:       "RuntimeAddType",
-    RuntimeIfType:        "RuntimeIfType",
-    Unreachable:          "Unreachable",
+    IfCondNotBoolean:   "IfCondNotBoolean",
+    IfBranchesMismatch: "IfBranchesMismatch",
+    RuntimeAddType:     "RuntimeAddType",
+    RuntimeIfType:      "RuntimeIfType",
+    Unreachable:        "Unreachable",
 } as const;
 export type ErrorCode = typeof ErrorCode[keyof typeof ErrorCode];
 
-// --- エラーメッセージ（表示用：i18n差し替え可）
+// --- エラーメッセージ（表示用）
 export const Messages: Record<ErrorCode, string> = {
     [ErrorCode.IfCondNotBoolean]:   "if condition must be Boolean",
     [ErrorCode.IfBranchesMismatch]: "if branches must have the same type",
@@ -59,7 +71,7 @@ export const Messages: Record<ErrorCode, string> = {
     [ErrorCode.Unreachable]:        "unreachable",
 };
 
-// ====== 2) AST / 型 / Result ===========================================
+// ====== 2) AST / Type / Value / Result =================================
 
 export type Term =
     | { tag: typeof TermTag.True }
@@ -71,6 +83,10 @@ export type Term =
 export type Type =
     | { tag: typeof TypeTag.Boolean }
     | { tag: typeof TypeTag.Number };
+
+export type Value =
+    | { tag: typeof ValueTag.Boolean; value: boolean }
+    | { tag: typeof ValueTag.Number;  value: number };
 
 export type Err<E> = { tag: typeof ResultTag.Err; error: ReadonlyArray<E> };
 export type Ok<A>  = { tag: typeof ResultTag.Ok;  value: A };
@@ -132,23 +148,21 @@ export function foldTerm<A>(alg: TermAlg<A>, t: Term): A {
     }
 }
 
-// ====== 5) 評価器（Value文字列も定数利用）==============================
-
-type Value = number | boolean;
+// ====== 5) 評価器（Value もタグ管理でJS値に依存しない）=================
 
 const evalAlg: TermAlg<Value> = {
-    True:   () => true,
-    False:  () => false,
-    Number: (n) => n,
+    True:   () => ({ tag: ValueTag.Boolean, value: true }),
+    False:  () => ({ tag: ValueTag.Boolean, value: false }),
+    Number: (n) => ({ tag: ValueTag.Number,  value: n }),
     Add:    (l, r) => {
-        if (typeof l !== "number" || typeof r !== "number")
+        if (l.tag !== ValueTag.Number || r.tag !== ValueTag.Number)
             throw new Error(Messages[ErrorCode.RuntimeAddType]);
-        return l + r;
+        return { tag: ValueTag.Number, value: l.value + r.value } as const;
     },
     If: (c, t, e) => {
-        if (typeof c !== "boolean")
+        if (c.tag !== ValueTag.Boolean)
             throw new Error(Messages[ErrorCode.RuntimeIfType]);
-        return c ? t : e;
+        return c.value ? t : e;
     },
 };
 
@@ -207,19 +221,17 @@ const typecheckAlg: TermAlg<Result<Type, ErrorCode>> = {
 export const typecheck = (t: Term): Result<Type, ErrorCode> =>
     foldTerm(typecheckAlg, t);
 
-// （必要なら）エラーを表示用文字列に変換
+// 表示用にエラーコードをメッセージへ
 export const formatErrors = (errs: ReadonlyArray<ErrorCode>) =>
     errs.map((e) => Messages[e]);
 
 // ====== 8) 動作テスト ====================================================
 
 const t1 = parseArith("1 + 2") as Term;
-console.log("pretty:", pretty(t1));        // => "(1 + 2)"
-console.log("eval:  ", evaluate(t1));      // => 3
-const ty1 = typecheck(t1);
-console.log("type:  ", ty1);
+console.log("pretty:", pretty(t1));                    // => "(1 + 2)"
+console.log("eval:  ", evaluate(t1));                  // => { tag:"NumValue", value:3 }
+console.log("type:  ", typecheck(t1));                 // => Ok { tag: "Number" }
 
-const t2 = parseArith("true + 2") as Term;
-const ty2 = typecheck(t2);
-console.log("type2: ",
-    ty2.tag === ResultTag.Err ? formatErrors(ty2.error) : ty2);
+// const t2 = parseArith("true + 2") as Term;
+// const ty2 = typecheck(t2);
+// console.log("type2: ", ty2.tag === ResultTag.Err ? formatErrors(ty2.error) : ty2);
