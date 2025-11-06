@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
-import { parseArith, typeShow } from "npm:tiny-ts-parser";
-import { typecheck } from "./arith.ts";
+import {parseArith, typeShow} from "npm:tiny-ts-parser";
+import {typecheck} from "./arith.ts";
 
 function run(code: string) {
   return typecheck(parseArith(code));
