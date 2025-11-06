@@ -1,5 +1,5 @@
 // ====== imports ======
-import { error as parseError, parseBasic } from "npm:tiny-ts-parser"; // 位置付きエラーをそのまま利用
+import {error as parseError, parseBasic} from "npm:tiny-ts-parser"; // 位置付きエラーをそのまま利用
 
 // ====== 1) 定数群（タグ/エラー文言）=====================================
 
@@ -71,6 +71,22 @@ const extendEnv = (
     ...Object.fromEntries(entries),
   });
 
+// レキシカル環境っぽく、親を env にした空オブジェクトに新バインディングだけ載せます。
+// これだと コピーを一切しないので、作成は実質 O(n)（新規バインディング分のみ）で、
+// 既存環境サイズ |env| に依存するコピーが消えます。
+// 参照は env[name] のプロトタイプ探索で解決（スコープが深くても通常は浅い）
+// メモリも親のプロパティを再コピーしないぶん小さくなる
+// 注意点：Object.keys(child) は自分のキーのみ返し、親のキーは返しません（それでOKなら最高）
+// const extendEnv = (
+//   env: TypeEnv,
+//   entries: ReadonlyArray<readonly [string, Type]>,
+// ): TypeEnv => {
+//   const child = Object.create(env) as TypeEnv;
+//   for (const [k, v] of entries) {
+//     Object.defineProperty(child, k, { value: v, enumerable: true, configurable: false, writable: false });
+//   }
+//   return Object.freeze(child);
+// };
 // ====== 3) 型等価（引数名は無視、型だけ比較）===========================
 
 export function typeEq(a: Type, b: Type): boolean {
