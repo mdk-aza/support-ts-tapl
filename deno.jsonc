@@ -4,5 +4,18 @@
       "lineWidth": 120,
       "semiColons": true
     }
+  },
+  /* npmインポートをまとめる */
+  "imports": {
+    "ts-pattern": "npm:ts-pattern@^5.0.0",
+    "@typescript-eslint/typescript-estree": "npm:@typescript-eslint/typescript-estree"
+  },
+  // よく使うコマンドをタスク化
+  "tasks": {
+    "run-example": "deno -A --allow-read support-ts-tapl/example.ts",
+    "run-example-fp": "deno -A --allow-read support-ts-tapl/example-fp.ts",
+    "run-start": "deno -A --allow-read support-ts-tapl/start.ts",
+    // 一括テスト（*_test.ts を全部）
+    "test": "deno test -A"
   }
 }
