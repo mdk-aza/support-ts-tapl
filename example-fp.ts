@@ -183,6 +183,8 @@ export const pretty = (t: Term): string => foldTerm(printAlg, t);
 // ====== 7) 型検査器（Result<Type, ErrorCode>：文言は最後に変換）========
 
 const sameType = (a: Type, b: Type) => a.tag === b.tag;
+const errsOf = <A>(r: Result<A, ErrorCode>) =>
+    r.tag === ResultTag.Err ? r.error : ([] as ErrorCode[]);
 
 const typecheckAlg: TermAlg<Result<Type, ErrorCode>> = {
     True:   () => ok({ tag: TypeTag.Boolean }),
@@ -197,24 +199,12 @@ const typecheckAlg: TermAlg<Result<Type, ErrorCode>> = {
         }),
 
     If: (rc, rt, re) => {
-        const errors: ErrorCode[] = [];
-
-        if (rc.tag === ResultTag.Ok && rc.value.tag !== TypeTag.Boolean)
-            errors.push(ErrorCode.IfCondNotBoolean);
-
-        if (rt.tag === ResultTag.Ok && re.tag === ResultTag.Ok && !sameType(rt.value, re.value))
-            errors.push(ErrorCode.IfBranchesMismatch);
-
-        if (rc.tag === ResultTag.Err) errors.push(...rc.error);
-        if (rt.tag === ResultTag.Err) errors.push(...rt.error);
-        if (re.tag === ResultTag.Err) errors.push(...re.error);
-
-        if (errors.length) return err(...errors);
-        return ok(
-            rt.tag === ResultTag.Ok ? rt.value :
-                re.tag === ResultTag.Ok ? re.value :
-                    { tag: TypeTag.Boolean } // 到達しないダミー
-        );
+        const all = [
+            ...errsOf(rc), ...errsOf(rt), ...errsOf(re),
+            ...(rc.tag === ResultTag.Ok && rc.value.tag !== TypeTag.Boolean ? [ErrorCode.IfCondNotBoolean] : []),
+            ...(rt.tag === ResultTag.Ok && re.tag === ResultTag.Ok && !sameType(rt.value, re.value) ? [ErrorCode.IfBranchesMismatch] : []),
+        ];
+        return all.length ? err(...all) : ok(rt.value);
     },
 };
 
