@@ -4,6 +4,14 @@ import {error} from "npm:tiny-ts-parser"; // ← これを追加！
 
 // ====== 1) 定数群（タグ/記号/JS型名/エラー）============================
 
+// 1️⃣ 帰納的定義（Inductive Definition）
+// これが 帰納的定義（inductive definition）。
+// True や False は 基本要素（base case）
+// Add, If は 再帰ステップ（inductive case）
+// 「有限回の適用で作れるすべてのもの」＝ 最小閉集合
+// これが “最小の閉包 (least fixed point)”
+// ＝ Milewski本で言う μF（初代数）に相当します。
+
 // --- ASTタグ（Term）
 export const TermTag = {
   True: "true",
@@ -122,6 +130,53 @@ export const map2 = <A, B, C, E>(
 
 // ====== 4) fold（catamorphism：再帰の形を一箇所に集約）=================
 
+// 2️⃣ 構造的帰納法（Structural Induction）
+// TAPLで言っていること
+//
+// 「帰納的に定義されたものの性質を証明したければ、“構造ごとに場合分け”して証明する。」
+//
+// たとえば次の性質を証明したい：
+//
+// P(t): 「任意の Term t について、ノード数は有限である」
+//
+// 帰納法のやり方
+//
+// 基本ケース: True, False, Number は明らかに有限。
+//
+// 帰納ステップ: Add(left, right) のとき
+// 左右が有限 → 和も有限。
+//
+// 他の構築子も同様。
+// これが「構造的帰納法の計算的側面」＝ 構造的再帰 (structural recursion)。
+// function isFiniteTerm(t: Term): boolean {
+//     switch (t.tag) {
+//         case TermTag.True:
+//         case TermTag.False:
+//         case TermTag.Number:
+//             return true; // 基底
+//         case TermTag.Add:
+//             return isFiniteTerm(t.left) && isFiniteTerm(t.right); // 帰納ステップ
+//         case TermTag.If:
+//             return (
+//                 isFiniteTerm(t.cond) &&
+//                 isFiniteTerm(t.thn) &&
+//                 isFiniteTerm(t.els)
+//             );
+//     }
+// }
+
+// 3️⃣ 構造的再帰（Structural Recursion）
+//
+// TAPLではこう説明されます：
+//
+// 帰納的定義に対応して、再帰関数を「構造に従って」書けば、
+// その関数は停止するし、全域的に定義される。
+
+// 各ケースで再帰が子構造にのみ進む（小さくなる）
+//
+// 構造が有限 → 再帰も有限
+// → 停止性 (termination) が保証される。
+
 type TermAlg<A> = {
   True: () => A;
   False: () => A;
@@ -130,28 +185,84 @@ type TermAlg<A> = {
   If: (c: A, t: A, e: A) => A;
 };
 
-export function foldTerm<A>(alg: TermAlg<A>, t: Term): A {
-  switch (t.tag) {
-    case TermTag.True:
-      return alg.True();
-    case TermTag.False:
-      return alg.False();
-    case TermTag.Number:
-      return alg.Number(t.n);
-    case TermTag.Add: {
-      const l = foldTerm(alg, t.left);
-      const r = foldTerm(alg, t.right);
-      return alg.Add(l, r);
-    }
-    case TermTag.If: {
-      const c = foldTerm(alg, t.cond);
-      const th = foldTerm(alg, t.thn);
-      const el = foldTerm(alg, t.els);
-      return alg.If(c, th, el);
-    }
-  }
-}
+// export function foldTerm<A>(alg: TermAlg<A>, t: Term): A {
+//   switch (t.tag) {
+//     case TermTag.True:
+//       return alg.True();
+//     case TermTag.False:
+//       return alg.False();
+//     case TermTag.Number:
+//       return alg.Number(t.n);
+//     case TermTag.Add: {
+//       const l = foldTerm(alg, t.left);
+//       const r = foldTerm(alg, t.right);
+//       return alg.Add(l, r);
+//     }
+//     case TermTag.If: {
+//       const c = foldTerm(alg, t.cond);
+//       const th = foldTerm(alg, t.thn);
+//       const el = foldTerm(alg, t.els);
+//       return alg.If(c, th, el);
+//     }
+//   }
+// }
 
+// 4️⃣ 停止性 (Termination) と 全域性 (Totality)
+//
+// TAPL 3.5–3.6節の主張：
+//
+// 構造的再帰 は必ず停止する。
+//
+// 全域的（total）：すべての Term に結果を返す。
+//
+// 部分関数（partial） ではない。
+
+// size は必ず停止して数値を返す
+//
+// 入力に対応しないパターンが存在しない（網羅的）
+// → 全域・停止的
+//
+// これが TAPLでいう “構造的再帰 = 全域停止関数”。
+
+// function size(t: Term): number {
+//     switch (t.tag) {
+//         case TermTag.True:
+//         case TermTag.False:
+//         case TermTag.Number:
+//             return 1;
+//         case TermTag.Add:
+//             return 1 + size(t.left) + size(t.right);
+//         case TermTag.If:
+//             return 1 + size(t.cond) + size(t.thn) + size(t.els);
+//     }
+// }
+
+// 5️⃣ foldTerm の理論的意味
+//
+// TAPL第3章の「構造的再帰」を関数合成的に一般化すると
+// Milewski本の “catamorphism” になります。
+//
+// つまり：
+//
+// TAPLの言葉	あなたのコード	圏論的名称
+// 構造的再帰	foldTerm	catamorphism
+// 構造的帰納法	foldTerm の停止性・正しさの証明法	構造的 induction
+// 帰納的定義	Term 型	初代数 μF
+
+//6️⃣ TAPLがここで伝えたいコアメッセージ
+//
+// 🧠 「“構造”を基準に定義されたデータに対しては、
+// 構造を基準に再帰を書くことで、常に安全・停止・正しい関数が作れる。」
+//
+// これが後の「型検査器」「評価器」などすべての基盤になります。
+
+// 7️⃣ まとめ表
+// TAPLの概念	TypeScriptでの対応	安全性保証
+// 帰納的定義	type Term = ...	有限構造
+// 構造的帰納法	switch (t.tag) による全ケース分解	網羅性
+// 造的再帰	foldTerm	停止性・全域性
+// 型安全性の証明の準備	typecheck を foldTerm ベースで書く
+//
 // ====== 45
 type Child<A> = { out: A; node: Term };
 
@@ -267,7 +378,13 @@ const typecheckAlg: TermAlg<Result<Type, ErrorCode>> = {
 // export type TypecheckOut = Type | Err<ErrorCode>;
 // export const typecheck = (t: Term): TypecheckOut => { ... };
 
-export function typecheck(t: Term): Type {
+/**
+ * 型検査：当面は True/False/Number/Add/If のみ
+ * 将来的に Var/Func/Call/Seq/Const を扱うときのため env を受け取れるようにしておく。
+ * 既存呼び出しには影響なし（第2引数省略可）。
+ */
+export function typecheck(t: Term, env: TypeEnv = emptyEnv): Type {
+  // env は現状未使用（Var/Func 等を実装するときに利用）
   return paraTerm<Type>({
     True: () => ({ tag: TypeTag.Boolean }),
     False: () => ({ tag: TypeTag.Boolean }),
@@ -296,6 +413,20 @@ export function typecheck(t: Term): Type {
 }
 
 // export const formatErrors = (errs: ReadonlyArray<ErrorCode>) => errs.map((e) => Messages[e]);
+
+// ====== 2.5) 型環境 ================================================
+
+// 変数名 -> 型 の写像（将来 Var/Func/Call/Seq/Const で使用）
+export type TypeEnv = Readonly<Record<string, Type>>;
+
+// 空環境（外から注入しない限りは空でスタート）
+export const emptyEnv: TypeEnv = Object.freeze({});
+
+// 参照・更新ヘルパ（永続的＝元を破壊しない）
+export const envGet = (env: TypeEnv, name: string): Type | undefined => env[name];
+export const envSet = (env: TypeEnv, name: string, ty: Type): TypeEnv => ({ ...env, [name]: ty });
+export const envExtend = (env: TypeEnv, entries: ReadonlyArray<readonly [string, Type]>): TypeEnv =>
+  entries.reduce((e, [k, v]) => ({ ...e, [k]: v }), env);
 
 // ====== 6) 動作テスト（例）==============================================
 //
