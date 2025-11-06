@@ -1,5 +1,5 @@
 // ====== imports ======
-import {error as parseError, parseBasic} from "npm:tiny-ts-parser"; // 位置付きエラーをそのまま利用
+import { error as parseError, parseBasic } from "npm:tiny-ts-parser"; // 位置付きエラーをそのまま利用
 
 // ====== 1) 定数群（タグ/エラー文言）=====================================
 
@@ -58,8 +58,18 @@ export type Type =
 export type TypeEnv = Readonly<Record<string, Type>>;
 export const emptyEnv: TypeEnv = Object.freeze({});
 
-const extendEnv = (env: TypeEnv, entries: ReadonlyArray<readonly [string, Type]>): TypeEnv =>
-  entries.reduce((e, [k, v]) => ({ ...e, [k]: v }), env);
+// const extendEnv = (env: TypeEnv, entries: ReadonlyArray<readonly [string, Type]>): TypeEnv =>
+//   entries.reduce((e, [k, v]) => ({ ...e, [k]: v }), env);
+// 1. パフォーマンスの問題（O(n²)）
+// 2. 不変性の保証がない
+const extendEnv = (
+  env: TypeEnv,
+  entries: ReadonlyArray<readonly [string, Type]>,
+): TypeEnv =>
+  Object.freeze({
+    ...env,
+    ...Object.fromEntries(entries),
+  });
 
 // ====== 3) 型等価（引数名は無視、型だけ比較）===========================
 
