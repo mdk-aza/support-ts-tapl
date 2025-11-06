@@ -28,6 +28,9 @@ export const Messages = {
   RuntimeAddType: "number expected",
   UnknownVariable: "unknown variable",
   NotImplemented: "not implemented yet",
+  FuncExpected: "function expected",
+  ArgCountMismatch: "number of arguments mismatch",
+  ArgTypeMismatch: "argument type mismatch",
 } as const;
 
 // ====== 2) AST / Type / Env / Location =================================
@@ -139,7 +142,7 @@ type TermAlgR<A> = {
   If: (c: R<A>, t: R<A>, e: R<A>, loc: Location) => R<A>;
   Var: (name: string, loc: Location) => R<A>;
   Func: (params: Param[], body: R<A>, loc: Location) => R<A>;
-  // Call / Seq / Const は必要に応じて追加
+  Call: (f: R<A>, args: ReadonlyArray<R<A>>, loc: Location) => R<A>;
 };
 
 export function foldTermR<A>(alg: TermAlgR<A>, t: Term): R<A> {
@@ -168,6 +171,9 @@ export function foldTermR<A>(alg: TermAlgR<A>, t: Term): R<A> {
     case TermTag.Func:
       return alg.Func(t.params, foldTermR(alg, t.body), t.loc);
     case TermTag.Call:
+      const f = foldTermR(alg, t.func);
+      const args = t.args.map((a) => foldTermR(alg, a));
+      return alg.Call(f, args, t.loc);
     case TermTag.Seq:
     case TermTag.Const:
       return (_env) => errorAt(Messages.NotImplemented, t.loc);
@@ -209,6 +215,26 @@ const algType: TermAlgR<Type> = {
     const retR: R<Type> = local(withArgs)(body); // 本体は拡張環境で
     return mapR(retR, (retTy) => ({ tag: TypeTag.Func, params, retType: retTy } as Type));
   },
+  Call: (f, args, loc) => (env) => {
+    const fty = f(env);
+    if (fty.tag !== TypeTag.Func) {
+      errorAt(Messages.FuncExpected, loc);
+    }
+
+    const fn = fty as Extract<Type, { tag: typeof TypeTag.Func }>;
+    const argTys = args.map((a) => a(env));
+
+    if (fn.params.length !== argTys.length) {
+      errorAt(Messages.ArgCountMismatch, loc);
+    }
+
+    for (let i = 0; i < argTys.length; i++) {
+      if (!typeEq(fn.params[i].type, argTys[i])) {
+        errorAt(Messages.ArgTypeMismatch, loc);
+      }
+    }
+    return fn.retType;
+  },
 };
 
 // ====== 7) 公開 API =====================================================
@@ -234,6 +260,23 @@ const examples = [
 ];
 
 for (const code of examples) {
+  const term = parseBasic(code) as unknown as Term;
+  try {
+    const ty = typecheck(term);
+    console.log(`${code} :: ${ty.tag}`);
+  } catch (e) {
+    console.error(`${code} => ${(e as Error).message}`);
+  }
+}
+const callExamples = [
+  "((x: number) => x + 1)(41)", // OK : Number
+  "((x: number, y: number) => x)(1, 2)", // OK : Number
+  "((x: number) => x)(true)", // NG : argument type mismatch
+  "((x: number, y: number) => x)(1)", // NG : number of arguments mismatch
+  "(1)(2)", // NG : function expected
+];
+
+for (const code of callExamples) {
   const term = parseBasic(code) as unknown as Term;
   try {
     const ty = typecheck(term);
