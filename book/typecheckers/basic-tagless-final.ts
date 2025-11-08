@@ -1,53 +1,38 @@
 // -----------------------------------------------------------------------------
-// Effect-TS を用いた型検査器の実装 (★最終版★)
+// Tagless-Final スタイルによる Effect-TS 型検査器（最終版・超コメント入り）
 // -----------------------------------------------------------------------------
 //
-// ■ ひとことで言えば
+// ■ このファイルが目指すこと
+//   - 「構文(AST)の走査」と「意味（型検査・表示など）」を厳密に分離する。
+//   - “意味” は Lang<R> インタフェースの実装（インタプリタ）側に集約する。
+//   - 同じ AST を、型検査（R=Effect<...>）やプリティプリント（R=string）など
+//     複数の“意味”で安全に再解釈できる（＝Tagless-Final の本質）。
 //
-// このコードは、型検査のロジック（algType）とASTの走査（foldTermR）を分離しています。
-// さらに、内部的なエラー処理（TypeError）と環境の引き回し（TypeEnv）を
-// Effect-TS を使って純粋な値（Effect）として管理し、
-// 公開API（typecheck）でそれを実行して、従来通りの例外(throw)と戻り値(return)に変換しています。
+// ■ 旧（fold + 代数）版との主な違い（重要）
+//   1) 旧: `foldTermR(alg, t)` が「走査＋意味」を一緒に持っていた
+//      新: `interpret(L, t)` は「走査だけ」。意味は `Lang<R>` 実装（TypeOf/Pretty 等）に委譲
+//   2) 旧: 代数型 `TermAlgR<A>` は、子結果が `AlgEffect<A>`（= Effect）で固定だった
+//      新: `Lang<R>` は、子結果が汎用 `R`。Effect 固定から解放され、意味を抽象化
+//   3) 旧: `algType: TermAlgR<Type>` が型検査ロジックを持つ
+//      新: `TypeOf: Lang<AlgEffect<Type>>` が型検査ロジックを持つ（置き場所の移動）
+//   4) 旧: `Effect.suspend` で子計算をラップしていた箇所あり
+//      新: **削除**（Effect-TS のコンテキスト隔離が正しく効くことをテストで確認）
 //
-// ■ ★ Effect.suspend に関する「発見」★
+//   → 結果: 構文と意味が完全分離し、評価戦略の差し替え・比較・証明のモジュール性が向上。
+//            Effect.suspend の削除でコードも簡潔＆最適化余地アップ。
 //
-// 以前のバージョン (`typecheck_effect_commented.ts`) では、
-// `algType` の `Add`, `If`, `Call` の実装において、`yield* Effect.suspend(() => l)` のように
-// `Effect.suspend` を使って子ノードの計算をラップしていました。
-//
-// これは、`l` や `r` が `Func` や `Const` の結果（＝局所的なスコープ変更
-// `mapInputContext` を含む Effect）であった場合に、`Effect.gen` による合成が
-// `l` と `r` のスコープを混合させてしまう「スコープ漏れ」が（理論上）
-// 発生するのではないか、という「古典的な難問」を懸念したためでした。
-//
-// 【結論】
-// 後の詳細なテスト（`basic_test.ts` の `scope leak bug test`）の結果、
-// この懸念は不要であったことが判明しました。
-//
-// `Effect.suspend` を *削除した* このバージョンでも、`Effect-TS` のランタイム
-// （`flatMap` / `gen` のセマンティクス）が、`mapInputContext` による
-// 局所スコープを `yield*` の後続の計算に漏らさず、
-// **デフォルトで（自動的に）正しく隔離・復元する** ことが確認されました。
-//
-// したがって、`Effect.suspend` の呼び出しは、このケースにおいては
-// **不要** であり、むしろランタイムの最適化（フュージョン）を
-// 阻害する可能性のある冗長なコードでした。
-//
-// このファイルは、その `Effect.suspend` を取り除いた、
-// 最も効率的かつ堅牢な「最終版」の実装です。
-//
+// ■ 実行サンプル
+//   - 末尾の `if (import.meta.main)` を有効にすると、動作確認ができます。
 // -----------------------------------------------------------------------------
 
 // ====== imports ======
-// error as parseError は、エラー発生箇所のソースコードをハイライト表示するために使います。
-import {error as parseError} from "npm:tiny-ts-parser";
-// Effect-TS のコア機能
-// ★ pipe をインポート
+// tiny-ts-parser: ソース位置つきエラーメッセージ用（parseError）と簡易パーサ（parseBasic）
+import {error as parseError, parseBasic} from "npm:tiny-ts-parser";
+// Effect-TS: Context（Reader相当）、Effect（計算）、Exit（結果）、pipe（関数合成）
 import {Context, Data, Effect, Exit, pipe} from "npm:effect";
 
-// ====== 1) 定数群（タグ/エラー文言）=====================================
-// ASTノードの種別（"if", "add" など）を文字列リテラルで直接書く代わりに使用します。
-// これにより、タイプミスをコンパイラが検出でき、リファクタリングも容易になります。
+// ====== 1) タグ/メッセージ ====================================================
+// ASTタグ（文字列直書きの代わりに定数化）
 export const TermTag = {
     True: "true",
     False: "false",
@@ -61,39 +46,32 @@ export const TermTag = {
     Const: "const",
 } as const;
 
-// 型の種別（"Boolean", "Number" など）を定数として定義します。
+// 型タグ
 export const TypeTag = {
     Boolean: "Boolean",
     Number: "Number",
     Func: "Func",
 } as const;
 
-// エラーメッセージを定数として一元管理します。
-// これにより、文言の統一や将来的な国際化対応（i18n）が容易になります。
+// エラーメッセージ定数
 export const Messages = {
     IfCondNotBoolean: "boolean expected",
     IfBranchesMismatch: "then and else have different types",
     RuntimeAddType: "number expected",
     UnknownVariable: "unknown variable",
-    NotImplemented: "not implemented yet",
     FuncExpected: "function expected",
     ArgCountMismatch: "number of arguments mismatch",
     ArgTypeMismatch: "parameter type mismatch",
 } as const;
 
-// ====== 2) AST / Type / Env / Location =================================
-
-// ソースコード中の「位置」を表す型。
+// ====== 2) 位置情報/AST/型/環境 ==============================================
+// 位置・範囲（エラーメッセージのために全ノードが保持）
 export type Position = { line: number; column: number };
-// ソースコード中の「範囲」（開始位置から終了位置）を表す型。
-// これをASTの各ノードに持たせることで、型エラーの発生箇所を正確にユーザーに伝えられます。
 export type Location = { start: Position; end: Position };
-// 関数の仮引数の型。名前と型を持つ。
+// 関数引数
 export type Param = { name: string; type: Type };
 
-// AST (Abstract Syntax Tree; 抽象構文木) のノードを表す型。
-// | (ユニオン型) を使うことで、この言語のすべての構文要素を網羅的に表現します。
-// すべてのノードが loc: Location を持つのがポイントです。
+// AST 定義（最小の式言語：true/false/数値/加算/if/変数/関数/呼び出し/順序/定数束縛）
 export type Term =
     | { tag: typeof TermTag.True; loc: Location }
     | { tag: typeof TermTag.False; loc: Location }
@@ -106,297 +84,182 @@ export type Term =
     | { tag: typeof TermTag.Seq; body: Term; rest: Term; loc: Location }
     | { tag: typeof TermTag.Const; name: string; init: Term; rest: Term; loc: Location };
 
-// 型検査器が扱う「型」そのものを表すデータ構造。
+// 型（ブール/数値/関数）
 export type Type =
     | { tag: typeof TypeTag.Boolean }
     | { tag: typeof TypeTag.Number }
-    | { tag: typeof TypeTag.Func; params: Param[]; retType: Type }; // 関数型は引数の型と戻り値の型を持つ
+    | { tag: typeof TypeTag.Func; params: Param[]; retType: Type };
 
-// 型環境 (Type Environment) を表す型。
-// 変数名 (string) からその変数の型 (Type) へのマッピング（辞書）です。
-// Readonly にすることで、型検査中に意図せず環境が変更されることを防ぎます。
+// 型環境（Reader で扱いたいので Context サービス化）
 export type TypeEnv = Readonly<Record<string, Type>>;
-
-// --- Effect-TS による変更点 (1) ---
-// TypeEnv を Effect-TS の「サービス」として扱えるように Tag を作成します。
-// これが、手製の Reader (R<A>) を置き換える中心的な仕組みです。
-// '@app/TypeEnv' はデバッグ用の識別子です。
 export const TypeEnvTag = Context.GenericTag<TypeEnv>("@app/TypeEnv");
 export const emptyEnv: TypeEnv = Object.freeze({});
 
-/**
- * 既存の環境 env に対して、新しい変数の束縛 entries を追加した「新しい」環境を返すヘルパー関数。
- * 元の env は変更しない（不変性 Immutability を保つ）ことが重要です。
- *
- * @param env 親となる環境
- * @param entries
- * @returns 新しい変数が追加された子環境
- */
-const extendEnv = (
-    env: TypeEnv,
-    entries: ReadonlyArray<readonly [string, Type]>,
-): TypeEnv =>
-    // スプレッド構文を使い、元のenvをコピーした上で新しい束縛を追加します。
-    // Object.fromEntries で [key, value] の配列をオブジェクトに変換しています。
-    Object.freeze({
-        ...env,
-        ...Object.fromEntries(entries),
-    });
-
-// ====== 3) 型等価（変更なし）===========================
-/**
- * 2つの型 `a` と `b` が等価かどうかを判定します。
- * @param a 比較する型1
- * @param b 比較する型2
- * @returns 等価であれば true
- */
-export function typeEq(a: Type, b: Type): boolean {
-    // 1. タグが違えば、そもそも違う型
-    if (a.tag !== b.tag) return false;
-
-    // 2. タグごとの詳細な比較
-    switch (a.tag) {
-        case TypeTag.Boolean:
-        case TypeTag.Number:
-            // Boolean同士、Number同士は常に等価
-            return true;
-        case TypeTag.Func: {
-            // a と b が両方 Func であることは if (a.tag !== b.tag) で保証済み
-            const bb = b as Extract<Type, { tag: typeof TypeTag.Func }>;
-            // 2a. 引数の個数が違えば、違う型
-            if (a.params.length !== bb.params.length) return false;
-            // 2b. 引数の型を先頭から順に再帰的に比較
-            for (let i = 0; i < a.params.length; i++) {
-                // ここで typeEq を再帰的に呼んでいるのがポイント。
-                // 引数名 (a.params[i].name) は比較しないことに注意（型だけが重要）。
-                if (!typeEq(a.params[i].type, bb.params[i].type)) return false;
-            }
-            // 2c. 戻り値の型を再帰的に比較
-            return typeEq(a.retType, bb.retType);
-        }
-    }
-}
-
-// ====== 4) Reader（削除） =================
-// --- Effect-TS による変更点 (2) ---
-// 以前のコードにあった R<A>, pureR, asks, local, mapR などの
-// 手製 Reader コンビネータはすべて不要になりました。
-//
-// 以下の Effect-TS の機能がそれらを置き換えます。
-// ・ R<A> ( = (env: TypeEnv) => A )
-//   → Effect.Effect<A, E, R> ( = Effect.Effect<Type, TypeError, TypeEnv> )
-// ・ pureR ( = (a: A) => () => a )
-//   → Effect.succeed(a)
-// ・ asks ( = (f: (env: TypeEnv) => A) => (env) => f(env) )
-//   → Effect.gen(function*() { const env = yield* TypeEnvTag; return f(env); })
-// ・ local ( = (f: (env) => env) => (ra: R<A>) => (env) => ra(f(env)) )
-//   → Effect.mapInputContext((ctx) => Context.add(ctx, TypeEnvTag, f(Context.get(ctx, TypeEnvTag))))
-//   → または Effect.provideService(ra, TypeEnvTag, newEnv)
-// ・ mapR ( = (ra: R<A>, f: (a: A) => B) => (env) => f(ra(env)) )
-//   → Effect.map(ra, f)  または  pipe(ra, Effect.map(f))
-
-
-// ====== 4.5) 位置付きエラー（変更なし） ============
-// 1. エラー型は Effect-TS (Data) で定義
-// これにより、Effect の E (Error) チャネルで型安全に扱うことができます。
-// Data.TaggedError を使うと ._tag プロパティで判別可能なエラークラスを簡単に作れます。
+// 型付きエラー（Effect の E チャネル用）
+// Data.TaggedError を使うと _tag が乗る（判別可能共用体）
 export class TypeError extends Data.TaggedError("TypeError")<{
     readonly message: string;
     readonly loc: Location;
 }> {
 }
 
-/**
- * 指定された `loc` (Location) 情報を使って、詳細な型エラーをスローします。
- * この関数がスローする *標準の Error* は、
- * Effect の計算 (algType) の中で Effect.try によってキャッチされ、
- * 上記の *カスタム TypeError* に変換されます。
- *
- * @param msg エラーメッセージ (例: "boolean expected")
- * @param loc エラーが発生したASTノードの
- */
+// ソース位置つきエラーを投げる（Effect.try で Fail に変換して扱う）
 function errorAt(msg: string, loc: Location): never {
     try {
-        // npm:tiny-ts-parser の error 関数は、第2引数に { loc } を持つオブジェクトを
-        // 期待するため、`as any` でラップして渡しています。
-        // これがコンソールにソースコードの該当箇所をハイライト表示します。
-        parseError(msg, {loc} as any);
+        parseError(msg, {loc} as any); // 位置つき表示（環境が対応しない場合はフォールバックへ）
     } catch {
-        // parseError が throw しなかった場合（テスト環境などで）の保険
     }
-    // 念のため、標準的な "file:line:col" 形式のフォールバックエラーをスローします。
-    // この throw が Effect.try にキャッチされます。
-    const s = loc.start, e = loc.end;
+    const s = loc.start,
+        e = loc.end;
     throw new Error(`test.ts:${s.line}:${s.column + 1}-${e.line}:${e.column + 1} ${msg}`);
 }
 
-// ====== 5) 環境付き catamorphism（変更なし） ===========================
+// 環境拡張（イミュータブル）
+const extendEnv = (
+    env: TypeEnv,
+    entries: ReadonlyArray<readonly [string, Type]>
+): TypeEnv =>
+    Object.freeze({
+        ...env,
+        ...Object.fromEntries(entries),
+    });
 
-// --- Effect-TS による変更点 (3) ---
-// R<A> が Effect.Effect<A, TypeError, TypeEnv> に変わります。
-// A = 畳み込みの結果の型 (今回は Type)
-// E = 発生しうるエラー (今回は TypeError)
-// R = 必要な環境/サービス (今回は TypeEnv)
-type AlgEffect<A> = Effect.Effect<A, TypeError, TypeEnv>;
-
-/**
- * `Term` (AST) の各ノードに対応する処理をまとめた「代数 (Algebra)」の型。
- *
- * ここでの「代数 (Algebra)」とは、関数型プログラミングの文脈、特に
- * Catamorphism (fold) パターンで使われる用語です。
- * 一言でいうと、「データ構造（今回ならTerm）の『作り方』に1対1で対応する
- * 『処理の仕方』を定義したオブジェクト」のことです。
- *
- * `foldTermR` は、この代数を受け取ってASTを処理します。
- * すべての処理が `AlgEffect<A>` (＝ Effect<A, E, R>) を返すのが特徴です。
- */
-type TermAlgR<A> = {
-    True: (loc: Location) => AlgEffect<A>;
-    False: (loc: Location) => AlgEffect<A>;
-    Number: (n: number, loc: Location) => AlgEffect<A>;
-    // Add ノードの処理。l と r は、*子ノードを処理した結果の計算* AlgEffect<A> です。
-    Add: (l: AlgEffect<A>, r: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-    If: (c: AlgEffect<A>, t: AlgEffect<A>, e: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-    Var: (name: string, loc: Location) => AlgEffect<A>;
-    // Func ノードの処理。body は *子ノードを処理した結果の計算* AlgEffect<A> です。
-    Func: (params: Param[], body: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-    // Call ノード。argTerms はエラー位置報告のために Term そのものも受け取ります。
-    Call: (f: AlgEffect<A>, args: ReadonlyArray<AlgEffect<A>>, argTerms: ReadonlyArray<Term>, loc: Location) => AlgEffect<A>;
-    Seq: (body: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-    Const: (name: string, init: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-};
-
-/**
- * Catamorphism (または fold) を実現する関数。
- * この関数の責務は「ASTの木構造を再帰的にたどる」ことだけです。
- * 「各ノードで具体的に何をするか」は、引数 `alg` (代数) が決定します。
- *
- * これにより、「ASTの走査」と「具体的な処理（型検査、評価、コード生成など）」を
- * 完全に分離でき、コードの見通しが良くなります。
- *
- * @param alg ASTの各ノードに対する処理を定義したオブジェクト
- * @param t 処理対象のASTノード
- * @returns ノード t に対する処理をカプセル化した計算 `AlgEffect<A>`
- */
-export function foldTermR<A>(alg: TermAlgR<A>, t: Term): AlgEffect<A> {
-    switch (t.tag) {
-        // --- 葉 (Leaf) ノード ---
-        // 葉ノードは、対応する alg の関数を呼ぶだけです。
-        case TermTag.True:
-            return alg.True(t.loc);
-        case TermTag.False:
-            return alg.False(t.loc);
-        case TermTag.Number:
-            return alg.Number(t.n, t.loc);
-        case TermTag.Var:
-            return alg.Var(t.name, t.loc);
-
-        // --- 枝 (Branch) ノード ---
-        // 枝ノードは、まず子ノードに対して再帰的に foldTermR を呼び出し、
-        // その「結果（＝AlgEffect<A>）」を alg の関数に渡します。
-        case TermTag.Add:
-            return alg.Add(
-                foldTermR(alg, t.left), // 左の子を処理した「計算」
-                foldTermR(alg, t.right), // 右の子を処理した「計算」
-                t.loc,
-            );
-        case TermTag.If:
-            return alg.If(
-                foldTermR(alg, t.cond),
-                foldTermR(alg, t.thn),
-                foldTermR(alg, t.els),
-                t.loc,
-            );
-        case TermTag.Func:
-            // Func ノードも枝ノード。子である body を再帰的に処理します。
-            return alg.Func(t.params, foldTermR(alg, t.body), t.loc);
-        case TermTag.Call:
-            const f = foldTermR(alg, t.func);
-            const args = t.args.map((a) => foldTermR(alg, a)); // map で子ノードのリストを処理
-            return alg.Call(f, args, t.args, t.loc);
-
-        case TermTag.Seq: {
-            return alg.Seq(
-                foldTermR(alg, t.body),
-                foldTermR(alg, t.rest),
-                t.loc,
-            );
+// 型等価（関数型は引数列と戻り値を再帰的に比較。引数名は比較しない）
+export function typeEq(a: Type, b: Type): boolean {
+    if (a.tag !== b.tag) return false;
+    switch (a.tag) {
+        case TypeTag.Boolean:
+        case TypeTag.Number:
+            return true;
+        case TypeTag.Func: {
+            const bb = b as Extract<Type, { tag: typeof TypeTag.Func }>;
+            if (a.params.length !== bb.params.length) return false;
+            for (let i = 0; i < a.params.length; i++) {
+                if (!typeEq(a.params[i].type, bb.params[i].type)) return false;
+            }
+            return typeEq(a.retType, bb.retType);
         }
-        case TermTag.Const:
-            return alg.Const(
-                t.name,
-                foldTermR(alg, t.init),
-                foldTermR(alg, t.rest),
-                t.loc,
-            );
     }
 }
 
-// ====== 6) 型検査用の代数（★ Effect.suspend を削除した最終版） =========================
+// ====== 3) Tagless-Final: 「構文＝操作の集合（意味へ委譲）」インタフェース ======
+//
+// 【超重要】Lang<R> は「この言語の構文操作」を “データ” ではなく “操作/関数” として表す。
+// R は「意味の型」（＝解釈結果）。これを差し替えると、同じ構文を別の意味で解釈できる。
+// 例：R=Effect<Type,...> → 型検査、R=string → プリティ、R=Value → 実行系 …など。
+export interface Lang<R> {
+    True(loc: Location): R;
 
-// --- Effect-TS による変更点 (4) ---
-// ここが最も大きな変更点です。
-// (env) => { ... } という手動の Reader 実装が
-// Effect.gen (ジェネータ構文) や Effect.map/Effect.contextMap に置き換わります。
+    False(loc: Location): R;
 
-/**
- * `foldTermR` に渡すための、「型検査」に特化した代数 (Algebra)。
- * `A` が `Type` になる (AlgEffect<Type>) ように定義されています。
- * つまり、各ノードの処理は「環境 (TypeEnv) を要求し、型 (Type) を返すか、
- * もしくは型エラー (TypeError) で失敗する可能性のある計算 (Effect)」
- * となります。
- */
-const algType: TermAlgR<Type> = {
-    // True リテラルの型は、環境に依存せず常に Boolean
-    // Effect.succeed は pureR の代わり
+    Number(n: number, loc: Location): R;
+
+    Add(l: R, r: R, loc: Location): R;
+
+    If(c: R, t: R, e: R, loc: Location): R;
+
+    Var(name: string, loc: Location): R;
+
+    Func(params: Param[], body: R, loc: Location): R;
+
+    Call(
+        f: R,
+        args: ReadonlyArray<R>,
+        argTerms: ReadonlyArray<Term>, // エラー位置のため元ASTを渡す
+        loc: Location
+    ): R;
+
+    Seq(body: R, rest: R, loc: Location): R;
+
+    Const(name: string, init: R, rest: R, loc: Location): R;
+}
+
+// ====== 4) Tagless-Final: AST 走査器（interpret） ===============================
+//
+// interpret は「AST の走査だけ」を担当する。意味は一切持たず、Lang<R> に委譲する。
+// 旧 foldTermR との違いは、子結果の型が Effect 固定ではなく一般の R になっていること。
+export function interpret<R>(L: Lang<R>, t: Term): R {
+    switch (t.tag) {
+        case TermTag.True:
+            return L.True(t.loc);
+        case TermTag.False:
+            return L.False(t.loc);
+        case TermTag.Number:
+            return L.Number(t.n, t.loc);
+        case TermTag.Var:
+            return L.Var(t.name, t.loc);
+
+        case TermTag.Add: {
+            const l = interpret(L, t.left);
+            const r = interpret(L, t.right);
+            return L.Add(l, r, t.loc);
+        }
+        case TermTag.If: {
+            const c = interpret(L, t.cond);
+            const thn = interpret(L, t.thn);
+            const els = interpret(L, t.els);
+            return L.If(c, thn, els, t.loc);
+        }
+        case TermTag.Func: {
+            const body = interpret(L, t.body);
+            return L.Func(t.params, body, t.loc);
+        }
+        case TermTag.Call: {
+            const f = interpret(L, t.func);
+            const args = t.args.map((a) => interpret(L, a));
+            // ★ argTerms を一緒に渡すのは、型ミスマッチ時に “引数側の loc” を指すため
+            return L.Call(f, args, t.args, t.loc);
+        }
+        case TermTag.Seq: {
+            const body = interpret(L, t.body);
+            const rest = interpret(L, t.rest);
+            return L.Seq(body, rest, t.loc);
+        }
+        case TermTag.Const: {
+            const init = interpret(L, t.init);
+            const rest = interpret(L, t.rest);
+            return L.Const(t.name, init, rest, t.loc);
+        }
+    }
+}
+
+// ====== 5) 型検査インタプリタ（Lang<AlgEffect<Type>> の具象実装） =============
+//
+// ここが “意味” の本体（旧 algType に相当）。
+// Before: TermAlgR<Type>（子は AlgEffect<Type> 固定）
+// After : Lang<AlgEffect<Type>>（R として AlgEffect<Type> を指定）
+//
+// AlgEffect は Reader（TypeEnv）＋ Error（TypeError）を Effect-TS で表す。
+export type AlgEffect<A> = Effect.Effect<A, TypeError, TypeEnv>;
+
+export const TypeOf: Lang<AlgEffect<Type>> = {
+    // リテラル：環境に依存しないので Effect.succeed
     True: (_loc) => Effect.succeed({tag: TypeTag.Boolean}),
-    // False リテラルの型は、環境に依存せず常に Boolean
     False: (_loc) => Effect.succeed({tag: TypeTag.Boolean}),
-    // Number リテラルの型は、環境に依存せず常に Number
     Number: (_n, _loc) => Effect.succeed({tag: TypeTag.Number}),
 
-    // Var ノードの型は、環境に依存する
-    // (yield* TypeEnvTag は Context.Tag であり、mapInputContext された Effect ではないため)
+    // 変数：環境から型を引く。無ければ TypeError を Fail に積む。
     Var: (name, loc) =>
-        // Effect.gen は do 記法とも呼ばれ、同期的な
-        // async/await のように Effect を扱えます。
         Effect.gen(function* () {
-            // yield* TypeEnvTag は「現在の環境 TypeEnv を要求する」
-            // (手製 Reader の `asks` に相当)
             const env = yield* TypeEnvTag;
             const ty = env[name];
             if (!ty) {
-                // 変数が見つからない
                 const msg = `${Messages.UnknownVariable}: ${name}`;
-                // Effect.try は、try ブロックで発生した throw を
-                // catch ブロックで E チャネルのエラー (TypeError) に変換します。
                 return yield* Effect.try({
-                    try: () => errorAt(msg, loc), // この関数は throw する
-                    catch: () => new TypeError({message: msg, loc}), // Effect の失敗(E)チャネル用の型エラーに変換
+                    try: () => errorAt(msg, loc), // 位置つき throw
+                    catch: () => new TypeError({message: msg, loc}), // Fail に変換
                 });
             }
-            // 型が見つかった
             return ty;
         }),
 
-    // Add ノードの型検査
+    // 加算：両辺が Number であることを要求
+    // ★ 旧版との違い：Effect.suspend(...) ラップは削除。
+    //    → Effect-TS のランタイム（flatMap/gen）で Context 隔離が正しく保たれるため。
     Add: (l, r, loc) =>
         Effect.gen(function* () {
-            // l, r は Effect<Type, ...> です。
-            // (env) => l(env) の代わりに yield* で実行結果を取得します。
-            // ★★★
-            // [発見]
-            // 当初、スコープ漏れを防ぐために Effect.suspend で
-            // l と r をラップする必要がある
-            // と仮説を立てていたが、テストの結果、
-            // Effect-TS のランタイム（flatMap）が
-            // デフォルトでスコープを正しく隔離・復元することが判明した。
-            // したがって、suspend は不要である。
-            // ★★★
-            const lt = yield* l; // Effect.suspend を削除 (これが正解)
-            const rt = yield* r; // Effect.suspend を削除 (これが正解)
-
-            // 両方が Number でなければエラー
+            const lt = yield* l;
+            const rt = yield* r;
             if (lt.tag !== TypeTag.Number || rt.tag !== TypeTag.Number) {
                 const msg = Messages.RuntimeAddType;
                 return yield* Effect.try({
@@ -404,16 +267,13 @@ const algType: TermAlgR<Type> = {
                     catch: () => new TypeError({message: msg, loc}),
                 });
             }
-            // Add の結果は Number 型
             return {tag: TypeTag.Number};
         }),
 
-    // If ノードの型検査
+    // if：条件は Boolean、then/else の型一致を要求
     If: (c, t, e, loc) =>
         Effect.gen(function* () {
-            // 1. 条件 (cond) の型をチェック
-            // ★ [発見] Add と同様、suspend は不要。
-            const ct = yield* c; // Effect.suspend を削除
+            const ct = yield* c;
             if (ct.tag !== TypeTag.Boolean) {
                 const msg = Messages.IfCondNotBoolean;
                 return yield* Effect.try({
@@ -421,11 +281,8 @@ const algType: TermAlgR<Type> = {
                     catch: () => new TypeError({message: msg, loc}),
                 });
             }
-            // 2. then 節と else 節の型をチェック
-            const tt = yield* t; // Effect.suspend を削除
-            const ee = yield* e; // Effect.suspend を削除
-
-            // 3. then と else の型が等価かチェック (typeEq を使う)
+            const tt = yield* t;
+            const ee = yield* e;
             if (!typeEq(tt, ee)) {
                 const msg = Messages.IfBranchesMismatch;
                 return yield* Effect.try({
@@ -433,56 +290,35 @@ const algType: TermAlgR<Type> = {
                     catch: () => new TypeError({message: msg, loc}),
                 });
             }
-            // If 式全体の型は then 節の型
             return tt;
         }),
 
-    // Func ノードの型検査
-    // ★★★ 'Func' (これは変更なし) ★★★
-    // このノードは「スコープ変更を定義する」側であり、
-    // 「スコープ変更を消費する」側ではないため、suspend は不要です。
+    // 関数：スコープ拡張は mapInputContext/provideService で行うのが正道
     Func: (params, body, _loc) => {
-        // 1. `body` (Effect) が要求する環境(Context)を、
-        //    現在の環境(env) から変換（拡張）する Effect を作成します。
-        //    (手製 Reader の `local(withArgs)(body)` に相当)
+        // body の要求する Context を「パラメータを追加した環境」に差し替える
         const retEffect = pipe(
-            body, // body は AlgEffect<Type>
-            Effect.mapInputContext(
-                // この関数は「古い Context」を受け取り「新しい Context」を返します
-                (context: Context.Context<TypeEnv>) => {
-                    // 1a. 古い Context から現在の TypeEnv を取得
-                    const env = Context.get(context, TypeEnvTag);
-                    // 1b. 環境を拡張
-                    const newEnv = extendEnv(
-                        env,
-                        params.map((p) => [p.name, p.type] as const),
-                    );
-                    // 1c. 古い Context に「新しい TypeEnv」を上書きして返す
-                    return Context.add(context, TypeEnvTag, newEnv);
-                },
-            ),
+            body,
+            Effect.mapInputContext((context: Context.Context<TypeEnv>) => {
+                const env = Context.get(context, TypeEnvTag);
+                const newEnv = extendEnv(
+                    env,
+                    params.map((p) => [p.name, p.type] as const)
+                );
+                return Context.add(context, TypeEnvTag, newEnv);
+            })
         );
-
-        // 2. 拡張環境で実行される `retEffect` (ボディの型を返す計算) の
-        //    結果 (retTy) を使って、`Func` 型全体を構築します。
-        //    (手製 Reader の `mapR` に相当)
+        // 関数型の戻り値型を作って返す
         return pipe(
             retEffect,
-            Effect.map((retTy) => ({ // <- これが mapR 操作
-                tag: TypeTag.Func,
-                params,
-                retType: retTy,
-            }))
+            Effect.map((retTy) => ({tag: TypeTag.Func, params, retType: retTy}))
         );
     },
 
-    // Call ノードの型検査
-    // ★★★ 'Call' (suspend を削除) ★★★
+    // 呼び出し：関数型であること、引数個数・型一致を検査
+    // ★ 型ミス時の位置は「関数全体 loc」ではなく「該当引数の loc」を指す
     Call: (f, args, argTerms, loc) =>
         Effect.gen(function* () {
-            // 1. 呼び出される関数 f の型 (fty) を検査
-            // ★ [発見] Add と同様、suspend は不要。
-            const fty = yield* f; // Effect.suspend を削除
+            const fty = yield* f;
             if (fty.tag !== TypeTag.Func) {
                 const msg = Messages.FuncExpected;
                 return yield* Effect.try({
@@ -490,13 +326,7 @@ const algType: TermAlgR<Type> = {
                     catch: () => new TypeError({message: msg, loc}),
                 });
             }
-
-            // 2. 実引数 (args) の型 (argTys) をすべて検査
-            // Effect.all は Effect の配列を 1 つの Effect<Type[]> にします。
-            // ★ [発見] Add と同様、suspend は不要。
-            const argTys = yield* Effect.all(args); // Effect.suspend を削除
-
-            // 3. 仮引数と実引数の「個数」を比較
+            const argTys = yield* Effect.all(args);
             if (fty.params.length !== argTys.length) {
                 const msg = Messages.ArgCountMismatch;
                 return yield* Effect.try({
@@ -504,209 +334,112 @@ const algType: TermAlgR<Type> = {
                     catch: () => new TypeError({message: msg, loc}),
                 });
             }
-
-            // 4. 仮引数と実引数の「型」を比較
             for (let i = 0; i < argTys.length; i++) {
                 if (!typeEq(fty.params[i].type, argTys[i])) {
-                    // ★ メッセージを修正
                     const msg = Messages.ArgTypeMismatch;
-                    // ★ エラー位置として、関数呼び出し `loc` ではなく
-                    //    型が合わない引数の位置 `argTerms[i].loc` を使う
                     return yield* Effect.try({
-                        try: () => errorAt(msg, argTerms[i].loc),
-                        catch: () => new TypeError({message: msg, loc: argTerms[i].loc}),
+                        try: () => errorAt(msg, argTerms[i].loc), // ★引数の位置を指す
+                        catch: () =>
+                            new TypeError({message: msg, loc: argTerms[i].loc}),
                     });
                 }
             }
-            // 5. Call 式全体の型は、関数の「戻り値の型 (retType)」
             return fty.retType;
         }),
 
-    // Seq ノードの型検査 (例: "1; true")
-    // ★★★ 'Seq' (suspend を削除) ★★★
+    // 順序：左を捨てて右の型を返す（左で失敗すれば当然失敗）
     Seq: (body, rest, _loc) =>
         Effect.gen(function* () {
-            // 1. body (1つ目の式) を評価します。
-            //    型エラーがあればここで失敗します。
-            //    結果の型は使いません。
-            // ★ [発見] Add と同様、suspend は不要。
-            yield* body; // Effect.suspend を削除
-            // 2. rest (2つ目の式) を評価し、その型を Seq 全体の型として返します。
-            // ★ [発見] Add と同様、suspend は不要。
-            return yield* rest; // Effect.suspend を削除
+            yield* body;
+            return yield* rest;
         }),
 
-    // Const ノードの型検査 (例: "const x = 1; x + 2")
-    // ★★★ 'Const' (suspend を削除) ★★★
+    // const 束縛：初期化式の型で環境を拡張して本体を検査
     Const: (name, init, rest, _loc) =>
         Effect.gen(function* () {
-            // 1. init (初期化式 "1") の型を評価します。
-            // ★ [発見] Add と同様、suspend は不要。
-            const initTy = yield* init; // Effect.suspend を削除
-            // 2. 現在の環境を取得します。
+            const initTy = yield* init;
             const currentEnv = yield* TypeEnvTag;
-            // 3. 現在の環境に "x" = Number を追加して、新しい環境 newEnv を作ります。
             const newEnv = extendEnv(currentEnv, [[name, initTy]]);
-
-            // 4. rest (本体 "x + 2") の計算 (Effect) に対して、
-            //    `Effect.provideService` を使って、
-            //    要求される TypeEnv サービスを newEnv で上書き（提供）します。
-            //    (Func で使った mapInputContext と同じことができます)
             return yield* Effect.provideService(rest, TypeEnvTag, newEnv);
         }),
 };
 
-// ====== 7) 公開 API（Fail と Die を正しく処理する）（変更なし） =========
-/**
- * 型検査器のエントリポイント。
- * @param t 型検査対象のAST
- * @param env 初期型環境 (グローバル変数など)。デフォルトは空。
- * @returns 型検査の結果 (Type)
- * @throws (Effect.try が catch した) 標準 Error
- */
-export function typecheck(t: any, env: TypeEnv = emptyEnv): Type {
-    // 1. foldTermR (AST走査) に algType (型検査ロジック) と t (AST) を渡す。
-    //    この結果は `computation` ( = Effect<Type, TypeError, TypeEnv> ) という
-    //    「計算の定義」です。この時点ではまだ実行されません。
-    const computation = foldTermR(algType, t);
+// ====== 6) 公開 API（fold版→Tagless-Final版の唯一の呼び出し差分） ============
+//
+// Before: const computation = foldTermR(algType, t);
+// After : const computation = interpret(TypeOf, t);  ← ← ← ここが唯一の変更点
+//
+// 以降（provideService → runSyncExit → Exit 判定）は同じ。
+export function typecheck(t: Term, env: TypeEnv = emptyEnv): Type {
+    // AST を「型検査という意味」で解釈
+    const computation = interpret(TypeOf, t);
 
-    // 2. その「計算」が要求する `TypeEnv` サービスに、
-    //    初期環境 `env` を提供（inject）します。
-    //    `runnable` は `Effect<Type, TypeError, never>` となり、
-    //    外部依存がなくなった（実行可能な）Effect になります。
-    // ★ Effect.provideService の引数順序を確認 (computation, Tag, env)
+    // 計算が要求する TypeEnv を注入
     const runnable = Effect.provideService(computation, TypeEnvTag, env);
 
-    // 3. `Effect.runSyncExit` で計算を同期的に実行し、
-    //    結果を `Exit<Type, TypeError>` 型で受け取ります。
-    //    `Exit` は成功 (Success) または失敗 (Failure) のいずれかです。
+    // 実行して Exit を受け取る（Success or Failure）
     const result = Effect.runSyncExit(runnable);
 
-    if (Exit.isSuccess(result)) {
-        // 4a. 成功した場合:
-        //     result.value に Type が入っているので、そのまま返します。
-        return result.value;
-    } else {
-        // 4b. 失敗した場合:
-        //     result.cause に失敗の原因 (Cause) が入っています。
-        if (result.cause._tag === "Fail") {
-            // 4b-1. `Fail` は、私たちが意図して発生させた
-            //        E チャネルのエラー (TypeError) です。
-            const err = result.cause.error;
-            // `TypeError` の情報 (message, loc) を `errorAt` に渡し、
-            // 従来通りの例外 (throw) を発生させます。
-            errorAt(err.message, err.loc);
-        }
-        if (result.cause._tag === "Die") {
-            // 4b-2. `Die` は、意図しない例外 (バグなど) です。
-            //        (例: Effect.try で catch し忘れた throw)
-            throw result.cause.defect;
-        }
-        // 4b-3. その他の Cause (Interrupt など)
-        throw new Error(`Typechecking failed (Unknown Cause): ${JSON.stringify(result.cause)}`);
+    if (Exit.isSuccess(result)) return result.value;
+
+    if (result.cause._tag === "Fail") {
+        const err = result.cause.error as TypeError;
+        errorAt(err.message, err.loc); // 位置つき例外として再throw
     }
+    if (result.cause._tag === "Die") {
+        throw result.cause.defect; // 予期しない例外
+    }
+    throw new Error(
+        `Typechecking failed (Unknown Cause): ${JSON.stringify(result.cause)}`
+    );
 }
 
-// ====== 8) 動作テスト（変更なし） =======================
-// (tiny-ts-parser の parseBasic をインポートする必要があります)
-/*
-import { parseBasic } from "npm:tiny-ts-parser";
+// ====== 7) もう一つの“意味”の例：プリティプリンタ ===========================
+//
+// 同じ構文を今度は「文字列」として解釈（Tagless-Final の威力デモ）
+export const Pretty: Lang<string> = {
+    True: () => "true",
+    False: () => "false",
+    Number: (n) => String(n),
+    Var: (name) => name,
+    Add: (l, r) => `(${l} + ${r})`,
+    If: (c, t, e) => `(${c} ? ${t} : ${e})`,
+    Func: (params, body) =>
+        `(${params.map((p) => `${p.name}: ${p.type.tag}`).join(", ")}) => ${body}`,
+    Call: (f, args) => `${f}(${args.join(", ")})`,
+    Seq: (body, rest) => `${body}; ${rest}`,
+    Const: (name, init, rest) => `const ${name} = ${init}; ${rest}`,
+};
 
-console.log("--- 単体テスト ---");
-try {
-    console.log(typecheck(parseBasic("(x: boolean) => 42") as unknown as Term, {}));
-    console.log(typecheck(parseBasic("(x: number) => x") as unknown as Term, {}));
-} catch (e) {
-    if (e instanceof TypeError) {
-        console.error(e.message);
-    } else {
-        console.error("Unknown error:", e);
-    }
-}
+// ====== 8) 実行例（Deno: deno run -A thisfile.ts） ===========================
+//
+// - 「Tagless-Final の構文→意味の分離」が効いていることがすぐ分かる動作確認。
+// - 解析対象の AST は tiny-ts-parser の parseBasic を使って作っている（簡易文法）。
+//
+if (import.meta.main) {
+    const code1 = "(x: number) => x + 1";
+    const code2 = "((x: number) => x)(true)"; // 型エラー例
 
-console.log("\n--- 基本的な例 (examples) ---");
-const examples = [
-    "true",
-    "false",
-    "true ? 1 : 2",
-    "1",
-    "1 + 2",
-    "true ? 1 : true",
-    "true + 1",
-    "1 + true",
-];
+    const term1 = parseBasic(code1) as unknown as Term;
+    console.log("Pretty:", interpret(Pretty, term1)); // => (x: Number) => (x + 1)
+    console.log("Type  :", typecheck(term1).tag);     // => "Func"
 
-for (const code of examples) {
-    const term = parseBasic(code) as unknown as Term;
     try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
+        const term2 = parseBasic(code2) as unknown as Term;
+        console.log("Type  :", typecheck(term2).tag);   // ここはエラーになるはず
     } catch (e) {
-        // errorAt でスローされた詳細なエラーメッセージが出力されます
-        console.error(`${code} => ${(e as Error).message}`);
+        console.error("TypeError:", (e as Error).message);
     }
 }
 
-console.log("\n--- 関数呼び出しの例 (callExamples) ---");
-const callExamples = [
-    "((x: number) => x + 1)(41)",
-    "((x: number, y: number) => x)(1, 2)",
-    "((x: number) => x)(true)",
-    "((x: number, y: number) => x)(1)",
-    "(1)(2)",
-];
-
-for (const code of callExamples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
-    } catch (e) {
-        console.error(`${code} => ${(e as Error).message}`);
-    }
-}
-
-console.log("\n--- Seq/Const の例 ---");
-const seqConstExamples = [
-    "const x = 1; x + 2",          // OK: Number
-    "const x = true; x ? 1 : 2",   // OK: Number
-    "1; 2",                         // OK: Number (Seq)
-    "const x = 1; const y = 2; x + y", // OK: Number
-    "const x = 1; y + 2",           // NG: unknown variable: y
-    "1; const x = true; x",         // OK: Boolean
-];
-
-for (const code of seqConstExamples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
-    } catch (e) {
-        console.error(`${code} => ${(e as Error).message}`);
-    }
-}
-
-console.log("\n--- 高階関数の例 ---");
-const higherOrderExamples = [
-    `
- const apply = (f: Func(Number, Number), x: Number) => f(x);
- apply((y: Number) => y + 1, 10)
- `, // OK: Number
-    `
- const twice = (f: Func(Number, Number)) => (x: Number) => f(f(x));
- const add2 = (y: Number) => y + 2;
- const add4 = twice(add2);
- add4(10)
- `, // OK: Number
-];
-
-for (const code of higherOrderExamples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`[Example] :: ${ty.tag}`);
-    } catch (e) {
-        console.error(`[Example] => ${(e as Error).message}`);
-    }
-}
+/* ここまで
+   ---------------------------------------------------------------
+   補足: Effect.suspend を消した理由（設計ノート）
+   - 旧実装では、子計算 l/r を gen の中で実行する際に suspend でラップしていた。
+   - 理由は「ローカルなコンテキスト（mapInputContext/provide）によるスコープ拡張が
+     gen の合成で漏れないか？」という懸念（古典的にある）。
+   - しかし Effect-TS のランタイムは Context を継続境界で正しく隔離/復元するため、
+     ここでの型検査器においては suspend なしで正しく動作することをテストで確認済み。
+   - 結果として、suspend は冗長＆最適化を阻害しうるため削除が望ましい。
+   ---------------------------------------------------------------
 */
