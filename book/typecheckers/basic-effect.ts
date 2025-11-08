@@ -127,6 +127,9 @@ type TermAlgR<A> = {
     Var: (name: string, loc: Location) => AlgEffect<A>;
     Func: (params: Param[], body: AlgEffect<A>, loc: Location) => AlgEffect<A>;
     Call: (f: AlgEffect<A>, args: ReadonlyArray<AlgEffect<A>>, loc: Location) => AlgEffect<A>;
+    Seq: (body: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
+    Const: (name: string, init: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
+
 };
 
 export function foldTermR<A>(alg: TermAlgR<A>, t: Term): AlgEffect<A> {
@@ -159,15 +162,20 @@ export function foldTermR<A>(alg: TermAlgR<A>, t: Term): AlgEffect<A> {
             const args = t.args.map((a) => foldTermR(alg, a));
             return alg.Call(f, args, t.loc);
 
-        // --- 未実装のノード (Effect.try でラップ) ---
-        case TermTag.Seq:
-        case TermTag.Const: {
-            const msg = Messages.NotImplemented;
-            return Effect.try({
-                try: () => errorAt(msg, t.loc),
-                catch: () => new TypeError({message: msg, loc: t.loc}),
-            });
+        case TermTag.Seq: {
+            return alg.Seq(
+                foldTermR(alg, t.body),
+                foldTermR(alg, t.rest),
+                t.loc,
+            );
         }
+        case TermTag.Const:
+            return alg.Const(
+                t.name,
+                foldTermR(alg, t.init),  // ✅ t.body ではなく t.init
+                foldTermR(alg, t.rest),
+                t.loc,
+            );
     }
 }
 
@@ -299,6 +307,25 @@ const algType: TermAlgR<Type> = {
             }
             return fty.retType;
         }),
+    // ★★★ 'Seq' の実装を追加 ★★★
+    Seq: (body, rest, _loc) =>
+        Effect.gen(function* () {
+            yield* Effect.suspend(() => body); // body を評価 (結果は使わない)
+            return yield* Effect.suspend(() => rest); // rest の型を返す
+        }),
+
+    // ★★★ 'Const' の実装を追加 ★★★
+    Const: (name, init, rest, _loc) =>
+        Effect.gen(function* () {
+            // init の型を評価
+            const initTy = yield* Effect.suspend(() => init);
+            // 現在の環境を取得
+            const currentEnv = yield* TypeEnvTag;
+            // 環境を拡張
+            const newEnv = extendEnv(currentEnv, [[name, initTy]]);
+            // rest を新しい環境で評価
+            return yield* Effect.provideService(rest, TypeEnvTag, newEnv);
+        }),
 };
 
 // ====== 7) 公開 API（Fail と Die を正しく処理する）（変更なし） =========
@@ -384,3 +411,35 @@ for (const code of callExamples) {
         }
     }
 }
+
+console.log("\n--- Seq/Const の例 ---");
+const seqConstExamples = [
+    "const x = 1; x + 2",          // OK: Number
+    "const x = true; x ? 1 : 2",   // OK: Number
+    "1; 2",                         // OK: Number (Seq)
+    "const x = 1; const y = 2; x + y", // OK: Number
+];
+
+for (const code of seqConstExamples) {
+    const term = parseBasic(code) as unknown as Term;
+    try {
+        const ty = typecheck(term);
+        console.log(`${code} :: ${ty.tag}`);
+    } catch (e) {
+        if (e instanceof TypeError) {
+            console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
+        } else {
+            console.error(`${code} => Unknown error:`, e);
+        }
+    }
+}
+
+// …（basic.ts の実装）…
+
+console.log(typecheck(parseBasic(`
+ const add = (x: number, y: number) => x + y;
+ const select = (b: boolean, x: number, y: number) => b ? x : y;
+ const x = add(1, add(2, 3));
+ const y = select(true, x, x);
+  y;
+`), {}));
