@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Effect-TS を用いた型検査器の実装 (★最終版★)
+// Effect-TS を用いた型検査器の実装
 // -----------------------------------------------------------------------------
 //
 // ■ ひとことで言えば
@@ -9,32 +9,40 @@
 // Effect-TS を使って純粋な値（Effect）として管理し、
 // 公開API（typecheck）でそれを実行して、従来通りの例外(throw)と戻り値(return)に変換しています。
 //
-// ■ ★ Effect.suspend に関する「発見」★
+// ■ なぜ Effect-TS を使うのか？ (モナドとの違い)
 //
-// 以前のバージョン (`typecheck_effect_commented.ts`) では、
-// `algType` の `Add`, `If`, `Call` の実装において、`yield* Effect.suspend(() => l)` のように
-// `Effect.suspend` を使って子ノードの計算をラップしていました。
+// 以前の実装（スニペット2、会話履歴参照）では、環境の引き回し（Reader）と
+// エラー処理（Exception）を、手製の素朴な関数 (R<A>, local, pureR, errorAt) で実装していました。
 //
-// これは、`l` や `r` が `Func` や `Const` の結果（＝局所的なスコープ変更
-// `mapInputContext` を含む Effect）であった場合に、`Effect.gen` による合成が
-// `l` と `r` のスコープを混合させてしまう「スコープ漏れ」が（理論上）
-// 発生するのではないか、という「古典的な難問」を懸念したためでした。
+// これを純粋な関数型の手法で抽象化する場合、一般的には「モナドトランスフォーマー」
+// （例えば `ReaderT<Error, Env, A>`）のようなアプローチが取られます。
+// しかし、モナドトランスフォーマーは型が複雑になりがちで、
+// 複数のエフェクト（Reader, Error, State...）を組み合わせるのが難しいという問題があります。
 //
-// 【結論】
-// 後の詳細なテスト（`basic_test.ts` の `scope leak bug test`）の結果、
-// この懸念は不要であったことが判明しました。
+// 一方、Effect-TS は「エフェクトシステム (Effect System)」という異なる発想に基づいています。
 //
-// `Effect.suspend` を *削除した* このバージョンでも、`Effect-TS` のランタイム
-// （`flatMap` / `gen` のセマンティクス）が、`mapInputContext` による
-// 局所スコープを `yield*` の後続の計算に漏らさず、
-// **デフォルトで（自動的に）正しく隔離・復元する** ことが確認されました。
+// 1. **関心の分離 (Separation of Concerns):**
+//    Effect-TS は、計算（処理ロジック）を `Effect<A, E, R>` という値として定義します。
+//    - `A` (Success): 成功した場合の型（今回は `Type`）
+//    - `E` (Error):   失敗した場合の型（今回は `TypeError`）
+//    - `R` (Resource): 計算が必要とする「環境」や「サービス」（今回は `TypeEnv`）
 //
-// したがって、`Effect.suspend` の呼び出しは、このケースにおいては
-// **不要** であり、むしろランタイムの最適化（フュージョン）を
-// 阻害する可能性のある冗長なコードでした。
+//    このように、ロジック・エラー・環境依存を型レベルで明示的に分離します。
 //
-// このファイルは、その `Effect.suspend` を取り除いた、
-// 最も効率的かつ堅牢な「最終版」の実装です。
+// 2. **合成可能性 (Composability):**
+//    `Effect.gen` (ジェネレータ) や `pipe` を使うことで、
+//    複数の `Effect` を「どの環境が必要か」「どのエラーが出うるか」を Effect-TS 自身に
+//    推論させながら、同期的な `async/await` のように自然に合成できます。
+//
+// 3. **実行の分離 (Separation of Execution):**
+//    `algType` や `foldTermR` で構築されるのは、あくまで「計算の定義（設計図）」です。
+//    `typecheck` 関数内で `Effect.provideService` と `Effect.runSyncExit` が
+//    呼び出されるまで、実際の計算は一切実行されません（遅延実行）。
+//
+// この「定義」と「実行」の分離こそがエフェクトシステムの核心であり、
+// モナドベースの実装よりも柔軟で、テストしやすく、依存関係の管理が容易なコードを実現します。
+//
+// このファイルは、その具体的な実装例です。
 //
 // -----------------------------------------------------------------------------
 
@@ -332,7 +340,7 @@ export function foldTermR<A>(alg: TermAlgR<A>, t: Term): AlgEffect<A> {
     }
 }
 
-// ====== 6) 型検査用の代数（★ Effect.suspend を削除した最終版） =========================
+// ====== 6) 型検査用の代数（Effect.gen と suspend を使用） =========================
 
 // --- Effect-TS による変更点 (4) ---
 // ここが最も大きな変更点です。
@@ -385,16 +393,12 @@ const algType: TermAlgR<Type> = {
             // l, r は Effect<Type, ...> です。
             // (env) => l(env) の代わりに yield* で実行結果を取得します。
             // ★★★
-            // [発見]
-            // 当初、スコープ漏れを防ぐために Effect.suspend で
-            // l と r をラップする必要がある
-            // と仮説を立てていたが、テストの結果、
-            // Effect-TS のランタイム（flatMap）が
-            // デフォルトでスコープを正しく隔離・復元することが判明した。
-            // したがって、suspend は不要である。
+            // l と r は Func (mapInputContext) の結果である可能性があるため、
+            // その環境変更（スコープ）がこの場で正しく適用されるよう、
+            // Effect.suspend で評価を遅延させ、ここで実行します。
             // ★★★
-            const lt = yield* l; // Effect.suspend を削除 (これが正解)
-            const rt = yield* r; // Effect.suspend を削除 (これが正解)
+            const lt = yield* Effect.suspend(() => l);
+            const rt = yield* Effect.suspend(() => r);
 
             // 両方が Number でなければエラー
             if (lt.tag !== TypeTag.Number || rt.tag !== TypeTag.Number) {
@@ -412,8 +416,8 @@ const algType: TermAlgR<Type> = {
     If: (c, t, e, loc) =>
         Effect.gen(function* () {
             // 1. 条件 (cond) の型をチェック
-            // ★ [発見] Add と同様、suspend は不要。
-            const ct = yield* c; // Effect.suspend を削除
+            // ★ c, t, e も Func の結果である可能性があるため suspend でラップ
+            const ct = yield* Effect.suspend(() => c);
             if (ct.tag !== TypeTag.Boolean) {
                 const msg = Messages.IfCondNotBoolean;
                 return yield* Effect.try({
@@ -422,8 +426,8 @@ const algType: TermAlgR<Type> = {
                 });
             }
             // 2. then 節と else 節の型をチェック
-            const tt = yield* t; // Effect.suspend を削除
-            const ee = yield* e; // Effect.suspend を削除
+            const tt = yield* Effect.suspend(() => t);
+            const ee = yield* Effect.suspend(() => e);
 
             // 3. then と else の型が等価かチェック (typeEq を使う)
             if (!typeEq(tt, ee)) {
@@ -438,9 +442,7 @@ const algType: TermAlgR<Type> = {
         }),
 
     // Func ノードの型検査
-    // ★★★ 'Func' (これは変更なし) ★★★
-    // このノードは「スコープ変更を定義する」側であり、
-    // 「スコープ変更を消費する」側ではないため、suspend は不要です。
+    // ★★★ 'Func' (mapInputContext を使った実装を維持) ★★★
     Func: (params, body, _loc) => {
         // 1. `body` (Effect) が要求する環境(Context)を、
         //    現在の環境(env) から変換（拡張）する Effect を作成します。
@@ -477,12 +479,12 @@ const algType: TermAlgR<Type> = {
     },
 
     // Call ノードの型検査
-    // ★★★ 'Call' (suspend を削除) ★★★
+    // ★★★ 'Call' (suspend を追加) ★★★
     Call: (f, args, argTerms, loc) =>
         Effect.gen(function* () {
             // 1. 呼び出される関数 f の型 (fty) を検査
-            // ★ [発見] Add と同様、suspend は不要。
-            const fty = yield* f; // Effect.suspend を削除
+            // ★ f は Func の結果である可能性が高いため suspend でラップ
+            const fty = yield* Effect.suspend(() => f);
             if (fty.tag !== TypeTag.Func) {
                 const msg = Messages.FuncExpected;
                 return yield* Effect.try({
@@ -493,8 +495,8 @@ const algType: TermAlgR<Type> = {
 
             // 2. 実引数 (args) の型 (argTys) をすべて検査
             // Effect.all は Effect の配列を 1 つの Effect<Type[]> にします。
-            // ★ [発見] Add と同様、suspend は不要。
-            const argTys = yield* Effect.all(args); // Effect.suspend を削除
+            // ★ args の中身も Func の結果である可能性があるため suspend でラップ
+            const argTys = yield* Effect.suspend(() => Effect.all(args));
 
             // 3. 仮引数と実引数の「個数」を比較
             if (fty.params.length !== argTys.length) {
@@ -523,26 +525,26 @@ const algType: TermAlgR<Type> = {
         }),
 
     // Seq ノードの型検査 (例: "1; true")
-    // ★★★ 'Seq' (suspend を削除) ★★★
+    // ★★★ 'Seq' の実装を追加 ★★★
     Seq: (body, rest, _loc) =>
         Effect.gen(function* () {
             // 1. body (1つ目の式) を評価します。
             //    型エラーがあればここで失敗します。
             //    結果の型は使いません。
-            // ★ [発見] Add と同様、suspend は不要。
-            yield* body; // Effect.suspend を削除
+            // ★ suspend でラップ
+            yield* Effect.suspend(() => body);
             // 2. rest (2つ目の式) を評価し、その型を Seq 全体の型として返します。
-            // ★ [発見] Add と同様、suspend は不要。
-            return yield* rest; // Effect.suspend を削除
+            // ★ suspend でラップ
+            return yield* Effect.suspend(() => rest);
         }),
 
     // Const ノードの型検査 (例: "const x = 1; x + 2")
-    // ★★★ 'Const' (suspend を削除) ★★★
+    // ★★★ 'Const' の実装を追加 ★★★
     Const: (name, init, rest, _loc) =>
         Effect.gen(function* () {
             // 1. init (初期化式 "1") の型を評価します。
-            // ★ [発見] Add と同様、suspend は不要。
-            const initTy = yield* init; // Effect.suspend を削除
+            // ★ suspend でラップ
+            const initTy = yield* Effect.suspend(() => init);
             // 2. 現在の環境を取得します。
             const currentEnv = yield* TypeEnvTag;
             // 3. 現在の環境に "x" = Number を追加して、新しい環境 newEnv を作ります。
