@@ -4,7 +4,7 @@
 // 公開API（typecheck）でそれを実行して、従来通りの例外(throw)と戻り値(return)に変換しています。
 
 // ====== imports ======
-import {error as parseError, parseBasic} from "npm:tiny-ts-parser";
+import {error as parseError} from "npm:tiny-ts-parser";
 // ★★★ pipe をインポート
 import {Context, Data, Effect, Exit, pipe} from "npm:effect";
 
@@ -126,7 +126,7 @@ type TermAlgR<A> = {
     If: (c: AlgEffect<A>, t: AlgEffect<A>, e: AlgEffect<A>, loc: Location) => AlgEffect<A>;
     Var: (name: string, loc: Location) => AlgEffect<A>;
     Func: (params: Param[], body: AlgEffect<A>, loc: Location) => AlgEffect<A>;
-    Call: (f: AlgEffect<A>, args: ReadonlyArray<AlgEffect<A>>, loc: Location) => AlgEffect<A>;
+    Call: (f: AlgEffect<A>, args: ReadonlyArray<AlgEffect<A>>, argTerms: ReadonlyArray<Term>, loc: Location) => AlgEffect<A>;
     Seq: (body: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
     Const: (name: string, init: AlgEffect<A>, rest: AlgEffect<A>, loc: Location) => AlgEffect<A>;
 
@@ -160,7 +160,7 @@ export function foldTermR<A>(alg: TermAlgR<A>, t: Term): AlgEffect<A> {
         case TermTag.Call:
             const f = foldTermR(alg, t.func);
             const args = t.args.map((a) => foldTermR(alg, a));
-            return alg.Call(f, args, t.loc);
+            return alg.Call(f, args, t.args, t.loc);
 
         case TermTag.Seq: {
             return alg.Seq(
@@ -273,7 +273,7 @@ const algType: TermAlgR<Type> = {
     },
 
     // ★★★ 'Call' (suspend を追加) ★★★
-    Call: (f, args, loc) =>
+    Call: (f, args, argTerms, loc) =>
         Effect.gen(function* () {
             // f は Func の結果である可能性が高いため suspend でラップ
             const fty = yield* Effect.suspend(() => f);
@@ -298,10 +298,10 @@ const algType: TermAlgR<Type> = {
 
             for (let i = 0; i < argTys.length; i++) {
                 if (!typeEq(fty.params[i].type, argTys[i])) {
-                    const msg = Messages.ArgTypeMismatch;
+                    const msg = "parameter type mismatch";
                     return yield* Effect.try({
-                        try: () => errorAt(msg, loc),
-                        catch: () => new TypeError({message: msg, loc}),
+                        try: () => errorAt(msg, argTerms[i].loc),
+                        catch: () => new TypeError({message: msg, loc: argTerms[i].loc}),
                     });
                 }
             }
@@ -329,7 +329,7 @@ const algType: TermAlgR<Type> = {
 };
 
 // ====== 7) 公開 API（Fail と Die を正しく処理する）（変更なし） =========
-export function typecheck(t: Term, env: TypeEnv = emptyEnv): Type {
+export function typecheck(t: any, env: TypeEnv = emptyEnv): Type {
     const computation = foldTermR(algType, t);
 
     // ★ Effect.provideService の引数順序を確認
@@ -341,7 +341,9 @@ export function typecheck(t: Term, env: TypeEnv = emptyEnv): Type {
         return result.value;
     } else {
         if (result.cause._tag === "Fail") {
-            throw result.cause.error;
+            const err = result.cause.error;
+            // TypeError の情報を使って errorAt を呼び出す
+            errorAt(err.message, err.loc);
         }
         if (result.cause._tag === "Die") {
             throw result.cause.defect;
@@ -351,95 +353,95 @@ export function typecheck(t: Term, env: TypeEnv = emptyEnv): Type {
 }
 
 // ====== 8) 動作テスト（変更なし） =======================
-console.log("--- 単体テスト ---");
-try {
-    console.log(typecheck(parseBasic("(x: boolean) => 42") as unknown as Term, {}));
-    console.log(typecheck(parseBasic("(x: number) => x") as unknown as Term, {}));
-} catch (e) {
-    if (e instanceof TypeError) {
-        console.error(e.message);
-    } else {
-        console.error("Unknown error:", e);
-    }
-}
-
-console.log("\n--- 基本的な例 (examples) ---");
-const examples = [
-    "true",
-    "false",
-    "true ? 1 : 2",
-    "1",
-    "1 + 2",
-    "true ? 1 : true",
-    "true + 1",
-    "1 + true",
-];
-
-for (const code of examples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
-    } catch (e) {
-        if (e instanceof TypeError) {
-            console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
-        } else {
-            console.error(`${code} => Unknown error:`, e);
-        }
-    }
-}
-
-console.log("\n--- 関数呼び出しの例 (callExamples) ---");
-const callExamples = [
-    "((x: number) => x + 1)(41)",
-    "((x: number, y: number) => x)(1, 2)",
-    "((x: number) => x)(true)",
-    "((x: number, y: number) => x)(1)",
-    "(1)(2)",
-];
-
-for (const code of callExamples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
-    } catch (e) {
-        if (e instanceof TypeError) {
-            console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
-        } else {
-            console.error(`${code} => Unknown error:`, e);
-        }
-    }
-}
-
-console.log("\n--- Seq/Const の例 ---");
-const seqConstExamples = [
-    "const x = 1; x + 2",          // OK: Number
-    "const x = true; x ? 1 : 2",   // OK: Number
-    "1; 2",                         // OK: Number (Seq)
-    "const x = 1; const y = 2; x + y", // OK: Number
-];
-
-for (const code of seqConstExamples) {
-    const term = parseBasic(code) as unknown as Term;
-    try {
-        const ty = typecheck(term);
-        console.log(`${code} :: ${ty.tag}`);
-    } catch (e) {
-        if (e instanceof TypeError) {
-            console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
-        } else {
-            console.error(`${code} => Unknown error:`, e);
-        }
-    }
-}
-
-// …（basic.ts の実装）…
-
-console.log(typecheck(parseBasic(`
- const add = (x: number, y: number) => x + y;
- const select = (b: boolean, x: number, y: number) => b ? x : y;
- const x = add(1, add(2, 3));
- const y = select(true, x, x);
-  y;
-`), {}));
+// console.log("--- 単体テスト ---");
+// try {
+//     console.log(typecheck(parseBasic("(x: boolean) => 42") as unknown as Term, {}));
+//     console.log(typecheck(parseBasic("(x: number) => x") as unknown as Term, {}));
+// } catch (e) {
+//     if (e instanceof TypeError) {
+//         console.error(e.message);
+//     } else {
+//         console.error("Unknown error:", e);
+//     }
+// }
+//
+// console.log("\n--- 基本的な例 (examples) ---");
+// const examples = [
+//     "true",
+//     "false",
+//     "true ? 1 : 2",
+//     "1",
+//     "1 + 2",
+//     "true ? 1 : true",
+//     "true + 1",
+//     "1 + true",
+// ];
+//
+// for (const code of examples) {
+//     const term = parseBasic(code) as unknown as Term;
+//     try {
+//         const ty = typecheck(term);
+//         console.log(`${code} :: ${ty.tag}`);
+//     } catch (e) {
+//         if (e instanceof TypeError) {
+//             console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
+//         } else {
+//             console.error(`${code} => Unknown error:`, e);
+//         }
+//     }
+// }
+//
+// console.log("\n--- 関数呼び出しの例 (callExamples) ---");
+// const callExamples = [
+//     "((x: number) => x + 1)(41)",
+//     "((x: number, y: number) => x)(1, 2)",
+//     "((x: number) => x)(true)",
+//     "((x: number, y: number) => x)(1)",
+//     "(1)(2)",
+// ];
+//
+// for (const code of callExamples) {
+//     const term = parseBasic(code) as unknown as Term;
+//     try {
+//         const ty = typecheck(term);
+//         console.log(`${code} :: ${ty.tag}`);
+//     } catch (e) {
+//         if (e instanceof TypeError) {
+//             console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
+//         } else {
+//             console.error(`${code} => Unknown error:`, e);
+//         }
+//     }
+// }
+//
+// console.log("\n--- Seq/Const の例 ---");
+// const seqConstExamples = [
+//     "const x = 1; x + 2",          // OK: Number
+//     "const x = true; x ? 1 : 2",   // OK: Number
+//     "1; 2",                         // OK: Number (Seq)
+//     "const x = 1; const y = 2; x + y", // OK: Number
+// ];
+//
+// for (const code of seqConstExamples) {
+//     const term = parseBasic(code) as unknown as Term;
+//     try {
+//         const ty = typecheck(term);
+//         console.log(`${code} :: ${ty.tag}`);
+//     } catch (e) {
+//         if (e instanceof TypeError) {
+//             console.error(`${code} => ${e.message} (at ${e.loc.start.line}:${e.loc.start.column})`);
+//         } else {
+//             console.error(`${code} => Unknown error:`, e);
+//         }
+//     }
+// }
+//
+// // …（basic.ts の実装）…
+//
+// console.log(typecheck(parseBasic(`
+//  const add = (x: number, y: number) => x + y;
+//  const select = (b: boolean, x: number, y: number) => b ? x : y;
+//  const x = add(1, add(2, 3));
+//  const y = select(true, x, x);
+//   y;
+// `), {}));
